@@ -1,0 +1,46 @@
+{
+  "build": {
+    "arduino": {
+      "ldscript": "esp32s3_out.ld",
+      "memory_type": "qio_opi",
+      "partitions": "partitions_16MB_littlefs.csv"
+    },
+    "core": "esp32",
+    "extra_flags": [
+      "-DARDUINO_ESP32S3_DEV",
+      "-DBOARD_HAS_PSRAM",
+      "-DARDUINO_USB_MODE=1",
+      "-DARDUINO_USB_CDC_ON_BOOT=1",
+      "-DARDUINO_RUNNING_CORE=1",
+      "-DARDUINO_EVENT_RUNNING_CORE=1"
+    ],
+    "f_cpu": "240000000L",
+    "f_flash": "80000000L",
+    "flash_mode": "qio",
+    "hwids": [
+      [
+        "0x303A",
+        "0x1001"
+      ]
+    ],
+    "mcu": "esp32s3",
+    "variant": "esp32s3"
+  },
+  "connectivity": [
+    "bluetooth",
+    "wifi"
+  ],
+  "frameworks": [
+    "arduino"
+  ],
+  "name": "ESP32-S3-DevKitC-1-N16R8 (16 MB Flash, 8 MB OPI PSRAM)",
+  "upload": {
+    "flash_size": "16MB",
+    "maximum_ram_size": 327680,
+    "maximum_size": 5242880,
+    "require_upload_port": true,
+    "speed": 921600
+  },
+  "url": "https://www.espressif.com/en/products/socs/esp32-s3",
+  "vendor": "Espressif"
+}
