@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge, chrome=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Portal Page for Sun Sync">
+    <link rel="stylesheet" href="./resources/css/normalize.css">
+    <link rel="stylesheet" href="./resources/css/index.css">
+    <link rel="stylesheet" href="./resources/css/theme.css">
+    <script>
+        window.SUNSYNC_API_BASE = window.SUNSYNC_API_BASE ||
+            (window.location.protocol === 'file:' ||
+                ['localhost', '127.0.0.1'].includes(window.location.hostname)
+                ? 'http://localhost:8000'
+                : '');
+    </script>
+    <title>Sun Sync - Piso Wi-Fi</title>
+</head>
+<body>
+    <div class="container">
+        <button class="theme-toggle" type="button" aria-label="Switch theme">Light theme</button>
+        <header>
+            <h1>Sun Sync Piso Wi-Fi and Charging Station</h1>
+            <p>Insert a coin to access the Internet</p>
+        </header>
+        <main class="content">
+            <div class="slot-status">
+                <h3>Insert Coin</h3>
+                <span class="coin-status" role="timer" aria-label="No active session">
+                    <span class="coin-clock" aria-hidden="true">00:00:00</span>
+                </span>
+                <div class="credit-status" aria-live="polite">
+                    <span>Credits</span>
+                    <strong id="credit-balance">0</strong>
+                    <p id="credit-help">Coin acceptor input is not configured.</p>
+                </div>
+            </div>
+            <table class="ref-table">
+                <thead>
+                    <tr>
+                        <th>Amount</th>
+                        <th>Wi-Fi</th>
+                        <th>Charging</th>
+                    </tr>
+                </thead>
+                <tbody>
+                        <tr data-denomination="1"><td>&#8369;1.00</td><td class="wifi-time">--</td><td class="charging-time">--</td></tr>
+                        <tr data-denomination="5"><td>&#8369;5.00</td><td class="wifi-time">--</td><td class="charging-time">--</td></tr>
+                        <tr data-denomination="10"><td>&#8369;10.00</td><td class="wifi-time">--</td><td class="charging-time">--</td></tr>
+                        <tr data-denomination="20"><td>&#8369;20.00</td><td class="wifi-time">--</td><td class="charging-time">--</td></tr>
+                </tbody>
+            </table>
+        </main>
+        <div class="btn-cont">
+            <button class="btn btn-pay" type="button" disabled>Pay</button>
+            <button class="btn btn-connect" type="button" disabled>Connect</button>
+            <button class="btn btn-charge" type="button" disabled>Charge</button>
+            <button class="btn btn-pause" type="button" disabled>Pause Time</button>
+        </div>
+        <p class="action-status" role="status" aria-live="polite"></p>
+        <footer>
+            <p>&copy; 2026 Sun Sync Wi-Fi. All rights reserved.</p>
+        </footer>
+    </div>
+    <script src="./resources/js/theme.js"></script>
+    <script src="./resources/js/index.js"></script>
+</body>
+</html>

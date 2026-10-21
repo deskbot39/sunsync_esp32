@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge, chrome=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Admin Login for Sun Sync">
+    <link rel="stylesheet" href="./resources/css/normalize.css">
+    <link rel="stylesheet" href="./resources/css/login.css">
+    <link rel="stylesheet" href="./resources/css/theme.css">
+    <script>
+        window.SUNSYNC_API_BASE = window.SUNSYNC_API_BASE ||
+            (window.location.protocol === 'file:' ||
+                ['localhost', '127.0.0.1'].includes(window.location.hostname)
+                ? 'http://localhost:8000'
+                : '');
+    </script>
+    <title>Sun Sync - Admin Login</title>
+</head>
+<body>
+    <div class="container">
+        <button class="theme-toggle" type="button" aria-label="Switch theme">Light theme</button>
+        <div>
+            <header>
+                <h2>Welcome Back</h2>
+                <p>Sign in to Manage your Sun Sync System</p>
+            </header>
+        </div>
+        <form action="" id="form-login" novalidate>
+            <div>
+                <label for="username">Username</label>
+                <input type="text" name="username" id="username" placeholder="Enter your username" autocomplete="username" required>
+            </div>
+            <div>
+                <label for="password">Password</label>
+                <div class="password-field">
+                    <input type="password" name="password" id="password" placeholder="Enter your password" autocomplete="current-password" required>
+                    <button type="button" id="toggle-password" aria-label="Show password">Show</button>
+                </div>
+            </div>
+
+            <div>
+                <input type="checkbox" name="remember_device" id="remember-device">
+                <label for="remember-device">Remember this device</label>
+            </div>
+            <button type="submit" id="login-submit">Sign In to Dashboard</button>
+        </form>
+        <div class="login-error" role="status" aria-live="polite"></div>
+        <footer>
+            <p>&copy; 2026 Sun Sync Wi-Fi. All rights reserved.</p>
+        </footer>
+    </div>
+    <script src="./resources/js/theme.js"></script>
+    <script src="./resources/js/login.js"></script>
+</body>
+</html>

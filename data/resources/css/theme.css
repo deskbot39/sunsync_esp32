@@ -1,0 +1,77 @@
+:root[data-theme='light'] {
+    --side-bg: #f1f5f9;
+    --side-text: #475569;
+    --side-activeb: #0284c7;
+    --side-textb: #0f172a;
+    --side-hoverb: #cbd5e1;
+    --color-border: #cbd5e1;
+    --color-text: #0f172a;
+    --head-bg: #ffffff;
+}
+
+body,
+.container,
+.panels,
+.sidebar,
+.dash-head,
+.card,
+.slot-status,
+.ref-table,
+#form-login {
+    transition: background-color 180ms ease, color 180ms ease, border-color 180ms ease;
+}
+
+.theme-toggle {
+    min-height: 2.35rem;
+    padding: 0.45rem 0.75rem;
+    border: 1px solid var(--side-hoverb);
+    background: var(--head-bg);
+    color: var(--side-textb);
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease;
+}
+
+.theme-toggle:hover,
+.theme-toggle:focus-visible {
+    border-color: var(--side-activeb);
+    background: var(--side-hoverb);
+}
+
+.theme-toggle:focus-visible {
+    outline: 2px solid var(--side-activeb);
+    outline-offset: 2px;
+}
+
+.container > .theme-toggle {
+    position: absolute;
+    z-index: 2;
+    top: clamp(1.25rem, 4vw, 2rem);
+    right: clamp(1.25rem, 4vw, 2rem);
+}
+
+@media (max-width: 700px) {
+    .container > .theme-toggle {
+        position: static;
+        align-self: flex-end;
+        margin-bottom: -0.75rem;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .theme-toggle,
+    body,
+    .container,
+    .panels,
+    .sidebar,
+    .dash-head,
+    .card,
+    .slot-status,
+    .ref-table,
+    #form-login {
+        transition-duration: 0.01ms !important;
+    }
+}

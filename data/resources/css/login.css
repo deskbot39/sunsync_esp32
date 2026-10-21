@@ -1,0 +1,294 @@
+:root {
+    --side-bg: #1e293b;
+    --side-text: #94a3b8;
+    --side-activeb: #0284c7;
+    --side-textb: #ffffff;
+    --side-hoverb: #334155;
+    --color-border: #e2e8f0;
+    --color-text: #1e293b;
+    --head-bg: #0f172a;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html {
+    min-height: 100%;
+}
+
+body {
+    min-width: 320px;
+    min-height: 100svh;
+    background: var(--side-bg);
+    color: var(--color-text);
+    font-family: 'Trebuchet MS', 'Segoe UI', sans-serif;
+}
+
+.container {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(18rem, 28rem);
+    grid-template-rows: 1fr auto;
+    gap: clamp(2rem, 8vw, 7rem);
+    align-items: center;
+    width: 100%;
+    min-height: 100svh;
+    margin: 0 auto;
+    padding: clamp(1.25rem, 5vw, 4rem);
+    overflow: hidden;
+    background: linear-gradient(135deg, var(--head-bg), var(--side-bg));
+}
+
+.container::before,
+.container::after {
+    position: absolute;
+    z-index: 0;
+    width: 16rem;
+    height: 16rem;
+    border: 1px solid var(--side-hoverb);
+    border-radius: 50%;
+    content: '';
+    opacity: 0.65;
+}
+
+.container::before {
+    top: -9rem;
+    right: -5rem;
+}
+
+.container::after {
+    bottom: -10rem;
+    left: -7rem;
+}
+
+.container > div,
+.container > form,
+.container > footer {
+    position: relative;
+    z-index: 1;
+}
+
+.container > div:first-child {
+    max-width: 34rem;
+    color: var(--side-textb);
+}
+
+header::before {
+    display: block;
+    width: 3.25rem;
+    height: 0.3rem;
+    margin-bottom: 1.2rem;
+    background: var(--side-activeb);
+    content: '';
+}
+
+header h2 {
+    margin: 0;
+    color: var(--side-textb);
+    font-size: clamp(2.5rem, 7vw, 5rem);
+    font-weight: 700;
+    line-height: 0.98;
+    text-shadow: 0 0 1px var(--head-bg);
+}
+
+header p {
+    max-width: 29rem;
+    margin: 1.4rem 0 0;
+    color: var(--side-text);
+    font-size: clamp(1rem, 2vw, 1.2rem);
+    line-height: 1.5;
+}
+
+#form-login {
+    display: grid;
+    gap: 1.25rem;
+    padding: clamp(1.5rem, 5vw, 2.5rem);
+    border: 1px solid var(--side-hoverb);
+    border-top: 0.35rem solid var(--side-activeb);
+    background: var(--head-bg);
+    box-shadow: 0 1.25rem 2.5rem var(--head-bg);
+}
+
+@media (min-width: 701px) {
+    #form-login {
+        margin-top: 1.25rem;
+    }
+}
+
+@media (min-width: 701px) and (max-height: 600px) {
+    #form-login {
+        transform: translateY(2.5rem);
+    }
+}
+
+#form-login > div {
+    display: grid;
+    gap: 0.5rem;
+}
+
+#form-login > div:nth-of-type(3) {
+    grid-template-columns: auto 1fr;
+    align-items: center;
+    gap: 0.55rem;
+    color: var(--side-text);
+    font-size: 0.82rem;
+}
+
+#form-login label {
+    color: var(--side-text);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
+
+#form-login input[type='text'],
+#form-login input[type='password'] {
+    width: 100%;
+    min-height: 3rem;
+    padding: 0.75rem 0.9rem;
+    border: 1px solid var(--side-hoverb);
+    background: var(--side-bg);
+    color: var(--side-textb);
+    font: inherit;
+}
+
+#form-login input::placeholder {
+    color: var(--side-text);
+    opacity: 0.8;
+}
+
+#form-login input:focus-visible {
+    outline: 2px solid var(--side-activeb);
+    outline-offset: 2px;
+}
+
+#form-login input[type='checkbox'] {
+    width: 1rem;
+    height: 1rem;
+    accent-color: var(--side-activeb);
+}
+
+#form-login a {
+    color: var(--side-textb);
+    text-underline-offset: 0.2em;
+}
+
+#form-login button {
+    min-height: 3.25rem;
+    border: 1px solid var(--side-activeb);
+    background: var(--side-activeb);
+    color: var(--side-textb);
+    cursor: pointer;
+    font: inherit;
+    font-weight: 700;
+    transition: background-color 180ms ease, transform 180ms ease;
+}
+
+#form-login button:hover,
+#form-login button:focus-visible {
+    background: var(--side-hoverb);
+}
+
+#form-login button:active {
+    transform: translateY(1px);
+}
+
+.login-error {
+    grid-column: 2;
+    min-height: 1.25rem;
+    color: var(--side-text);
+    font-size: 0.82rem;
+    line-height: 1.4;
+}
+
+.login-error.error {
+    color: #fca5a5;
+}
+
+.login-error.success {
+    color: #86efac;
+}
+
+footer {
+    grid-column: 1 / -1;
+    color: var(--side-text);
+    font-size: 0.78rem;
+}
+
+footer p {
+    margin: 0;
+}
+
+@media (max-width: 700px) {
+    .container {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        justify-content: center;
+        gap: 2.25rem;
+        padding: 1.25rem;
+    }
+
+    .container > div:first-child {
+        max-width: none;
+    }
+
+    header h2 {
+        font-size: clamp(2.5rem, 14vw, 4rem);
+    }
+
+    .login-error {
+        order: 3;
+    }
+
+    footer {
+        order: 4;
+        margin-top: 0.5rem;
+    }
+}
+
+@media (min-width: 701px) and (max-height: 760px) {
+    .container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+    }
+}
+
+.password-field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: stretch;
+    gap: 0.5rem;
+    width: 100%;
+}
+
+.password-field input {
+    display: block;
+    width: 100%;
+}
+
+#toggle-password {
+    min-height: 3rem;
+    padding: 0 0.65rem;
+    border: 1px solid var(--side-activeb);
+    background: var(--side-activeb);
+    color: var(--side-textb);
+    cursor: pointer;
+    font-size: 0.78rem;
+}
+
+#toggle-password:hover,
+#toggle-password:focus-visible {
+    color: var(--side-activeb);
+}
