@@ -66,3 +66,8 @@ LittleFS must be uploaded before first boot. The custom 16 MB partition table re
 The panel LCD (`0x27`) and battery LCD (`0x26`) each show the corresponding sensor's voltage and power on the first row and current on the second. A missing LCD is logged at startup and does not prevent the server or the other display from operating. Both LCD backpacks share the ESP32 I2C bus and must use the PCF8574-compatible backpack pin mapping expected by the `LiquidCrystal_PCF8574` driver.
 
 The web pages are served locally without depending on a CDN. HTTP is handled by ESPAsyncWebServer/AsyncTCP; sensor refresh and captive DNS remain lightweight loop/event work. HTML, CSS, and JavaScript are gzip-compressed during the PlatformIO build; the server negotiates gzip with browsers and allows static assets to be cached for an hour while revalidating HTML pages. Backend API base URLs retain the existing localhost setting during local development; device APIs use same-origin paths on the ESP32. The ESP32 does not implement login or backend session-creation routes.
+
+## Configuration
+
+Copy `include/wifi_config.example.h` to `include/wifi_config.h` and fill in Wi-Fi, MQTT, backend URL and device key. `wifi_config.h` is gitignored; never commit it.
+

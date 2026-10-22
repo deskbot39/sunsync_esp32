@@ -27,7 +27,9 @@ else:
     source_resources = web_root / "resources"
     if not source_resources.is_dir():
         raise RuntimeError("Sun Sync resources directory is missing: " + str(source_resources))
-    shutil.copytree(source_resources, project_dir / "data" / "resources", dirs_exist_ok=True)
+    # index.js is device-specific: it calls the ESP32 backend proxy, not the backend directly.
+    shutil.copytree(source_resources, project_dir / "data" / "resources", dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("index.js"))
     print("Synchronized the three Sun Sync pages and their static resources to LittleFS.")
 
 for source in project_dir.joinpath("data").rglob("*"):

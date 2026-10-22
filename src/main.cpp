@@ -7,9 +7,11 @@
 #include <esp_netif_sta_list.h>
 #include <esp_wifi.h>
 #include <LittleFS.h>
+#include <HTTPClient.h>
 #include <LiquidCrystal_PCF8574.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <lwip/opt.h>
 #if IP_NAPT && IP_FORWARD && ESP_L2_TO_L3_COPY
@@ -31,13 +33,16 @@ AsyncWebServer server(HTTP_PORT);
 DNSServer dnsServer;
 Adafruit_INA219 batteryIna219(SUNSYNC_INA219_BATTERY_ADDRESS);
 Adafruit_INA219 panelIna219(SUNSYNC_INA219_PANEL_ADDRESS);
-LiquidCrystal_PCF8574 panelLcd(SUNSYNC_LCD_PANEL_ADDRESS);
-LiquidCrystal_PCF8574 batteryLcd(SUNSYNC_LCD_BATTERY_ADDRESS);
+LiquidCrystal_PCF8574 lcd(SUNSYNC_LCD_ADDRESS);
 bool captivePortalActive = false;
 bool upstreamConnected = false;
 bool internetSharingEnabled = false;
 String accessPointSsid;
+#if SUNSYNC_MQTT_TLS
+WiFiClientSecure mqttNetClient;
+#else
 WiFiClient mqttNetClient;
+#endif
 PubSubClient mqttClient(mqttNetClient);
 uint32_t lastMqttAttemptMs = 0;
 uint32_t lastMqttPublishMs = 0;
@@ -52,8 +57,8 @@ struct Ina219Readings {
 
 Ina219Readings batteryReadings;
 Ina219Readings panelReadings;
-bool panelLcdAvailable = false;
-bool batteryLcdAvailable = false;
+bool lcdAvailable = false;
+String lcdLastLines[2];
 uint32_t lastSensorRefreshMs = 0;
 portMUX_TYPE coinSignalMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool coinPayWindowOpen = false;
@@ -140,61 +145,60 @@ String lcdLine(const String& value) {
     return line;
 }
 
-String formatLcdReading(const char* label, const Ina219Readings& readings) {
-    if (!readings.available || !isfinite(readings.busVoltageV) ||
-        !isfinite(readings.powerW)) {
-        return "Sensor unavailable";
-    }
-
+String formatLcdClock(uint32_t totalSeconds) {
     char line[SUNSYNC_LCD_COLUMNS + 1];
-    snprintf(line, sizeof(line), "%s:%5.2fV", label, readings.busVoltageV);
+    snprintf(line, sizeof(line), "%02lu:%02lu:%02lu",
+             static_cast<unsigned long>(totalSeconds / 3600),
+             static_cast<unsigned long>((totalSeconds / 60) % 60),
+             static_cast<unsigned long>(totalSeconds % 60));
     return String(line);
 }
 
-String formatLcdCurrent(const Ina219Readings& readings) {
-    if (!readings.available || !isfinite(readings.currentMa) ||
-        !isfinite(readings.powerW)) {
-        return "Check I2C sensor";
+uint32_t serviceSessionRemainingSeconds() {
+    uint32_t remainingMs = serviceSessionRemainingMs;
+    if (!serviceSessionPaused) {
+        const int32_t left = static_cast<int32_t>(serviceSessionEndsAt - millis());
+        remainingMs = left > 0 ? static_cast<uint32_t>(left) : 0;
     }
-
-    char line[SUNSYNC_LCD_COLUMNS + 1];
-    snprintf(line, sizeof(line), "I:%4.2fA P:%4.1fW",
-             readings.currentMa / 1000.0f, readings.powerW);
-    return String(line);
+    return (remainingMs + 999) / 1000;
 }
 
-void writeLcd(LiquidCrystal_PCF8574& lcd, const char* label,
-              const Ina219Readings& readings) {
-    lcd.setCursor(0, 0);
-    lcd.print(lcdLine(formatLcdReading(label, readings)));
-    lcd.setCursor(0, 1);
-    lcd.print(lcdLine(formatLcdCurrent(readings)));
+void updateLcd() {
+    if (!lcdAvailable) return;
+
+    String lines[2];
+    if (serviceSessionActive && serviceSessionIsCharging) {
+        lines[0] = "CHARGING TIME:";
+        lines[1] = formatLcdClock(serviceSessionRemainingSeconds());
+    } else if (serviceSessionActive) {
+        lines[0] = "CURRENT CREDITS:";
+        lines[1] = String(serviceSessionCredits);
+    } else {
+        lines[0] = "INSERT COIN:";
+        lines[1] = String(coinCredits);
+    }
+
+    for (uint8_t row = 0; row < 2; ++row) {
+        if (lines[row] != lcdLastLines[row]) {
+            lcd.setCursor(0, row);
+            lcd.print(lcdLine(lines[row]));
+            lcdLastLines[row] = lines[row];
+        }
+    }
 }
 
 void initializeDisplays() {
-    panelLcd.begin(SUNSYNC_LCD_COLUMNS, SUNSYNC_LCD_ROWS, Wire);
-    panelLcd.setBacklight(255);
-    panelLcdAvailable = panelLcd.isConnected();
-    if (panelLcdAvailable) {
-        panelLcd.clear();
-        writeLcd(panelLcd, "Panel", panelReadings);
+    lcd.begin(SUNSYNC_LCD_COLUMNS, SUNSYNC_LCD_ROWS, Wire);
+    lcd.setBacklight(255);
+    lcdAvailable = lcd.isConnected();
+    if (lcdAvailable) {
+        lcd.clear();
+        updateLcd();
     } else {
-        Serial0.printf("WARNING: Panel LCD not detected at I2C address 0x%02X.\n",
-                       SUNSYNC_LCD_PANEL_ADDRESS);
-    }
-
-    batteryLcd.begin(SUNSYNC_LCD_COLUMNS, SUNSYNC_LCD_ROWS, Wire);
-    batteryLcd.setBacklight(255);
-    batteryLcdAvailable = batteryLcd.isConnected();
-    if (batteryLcdAvailable) {
-        batteryLcd.clear();
-        writeLcd(batteryLcd, "Battery", batteryReadings);
-    } else {
-        Serial0.printf("WARNING: Battery LCD not detected at I2C address 0x%02X.\n",
-                       SUNSYNC_LCD_BATTERY_ADDRESS);
+        Serial0.printf("WARNING: LCD not detected at I2C address 0x%02X.\n",
+                       SUNSYNC_LCD_ADDRESS);
     }
 }
-
 String contentTypeForPath(const String& path) {
     if (path.endsWith(".html")) return "text/html; charset=utf-8";
     if (path.endsWith(".css")) return "text/css; charset=utf-8";
@@ -611,9 +615,174 @@ void handleHealth(AsyncWebServerRequest* request) {
     sendResponse(request, 200, "application/json; charset=utf-8", response);
 }
 
+// ---- Backend proxy: phones call /api/backend/*; only the ESP32 holds the device key.
+struct BackendJob {
+    AsyncWebServerRequestPtr request;
+    String method;
+    String path;
+    String body;
+};
+
+constexpr size_t BACKEND_QUEUE_LENGTH = 4;
+constexpr size_t BACKEND_MAX_RESPONSE_BYTES = 8192;
+QueueHandle_t backendQueue = nullptr;
+
+bool backendConfigured() {
+    return strlen(SUNSYNC_BACKEND_URL) > 0 && strlen(SUNSYNC_DEVICE_API_KEY) > 0;
+}
+
+bool isSafeIdentifier(const String& value, size_t maxLength) {
+    if (value.length() == 0 || value.length() > maxLength) return false;
+    for (size_t i = 0; i < value.length(); ++i) {
+        const char c = value[i];
+        if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') return false;
+    }
+    return true;
+}
+
+void backendWorker(void*) {
+    for (;;) {
+        BackendJob* job = nullptr;
+        if (xQueueReceive(backendQueue, &job, portMAX_DELAY) != pdTRUE || !job) continue;
+
+        int status = 502;
+        String payload = "{\"detail\":\"The backend is unreachable.\"}";
+        if (upstreamConnected) {
+            WiFiClientSecure client;
+            if (strlen(SUNSYNC_BACKEND_CA_CERT) > 0) {
+                client.setCACert(SUNSYNC_BACKEND_CA_CERT);
+            } else {
+                client.setInsecure();
+            }
+            HTTPClient http;
+            http.setConnectTimeout(8000);
+            http.setTimeout(8000);
+            if (http.begin(client, String(SUNSYNC_BACKEND_URL) + job->path)) {
+                http.addHeader("X-Device-Key", SUNSYNC_DEVICE_API_KEY);
+                if (job->body.length() > 0) http.addHeader("Content-Type", "application/json");
+                const int code = http.sendRequest(job->method.c_str(), job->body);
+                if (code > 0) {
+                    String received = http.getString();
+                    if (received.length() <= BACKEND_MAX_RESPONSE_BYTES) {
+                        status = code;
+                        payload = received.length() > 0 ? received : String("null");
+                    }
+                } else {
+                    Serial0.printf("Backend request failed: %s\n",
+                                   HTTPClient::errorToString(code).c_str());
+                }
+                http.end();
+            }
+        }
+        if (auto request = job->request.lock()) {
+            sendResponse(request.get(), status, "application/json; charset=utf-8", payload);
+        }
+        delete job;
+    }
+}
+
+void startBackendWorker() {
+    if (backendQueue) return;
+    backendQueue = xQueueCreate(BACKEND_QUEUE_LENGTH, sizeof(BackendJob*));
+    xTaskCreate(backendWorker, "backend", 12288, nullptr, 1, nullptr);
+}
+
+void forwardToBackend(AsyncWebServerRequest* request, const char* method,
+                      const String& path, const String& body = String()) {
+    if (!backendConfigured() || !backendQueue) {
+        sendResponse(request, 503, "application/json; charset=utf-8",
+                     "{\"detail\":\"Backend is not configured on this device.\"}");
+        return;
+    }
+    if (uxQueueSpacesAvailable(backendQueue) == 0) {
+        sendResponse(request, 503, "application/json; charset=utf-8",
+                     "{\"detail\":\"The device is busy. Try again shortly.\"}");
+        return;
+    }
+    BackendJob* job = new BackendJob{request->pause(), method, path, body};
+    if (xQueueSend(backendQueue, &job, 0) != pdTRUE) {
+        if (auto paused = job->request.lock()) {
+            sendResponse(paused.get(), 503, "application/json; charset=utf-8",
+                         "{\"detail\":\"The device is busy. Try again shortly.\"}");
+        }
+        delete job;
+    }
+}
+
+bool requireValidDevice(AsyncWebServerRequest* request, String& owner) {
+    owner = requestedPaymentOwner(request);
+    if (isSafeIdentifier(owner, 100)) return true;
+    sendResponse(request, 400, "application/json; charset=utf-8",
+                 "{\"detail\":\"A valid device_id is required.\"}");
+    return false;
+}
+
+void handleBackendRegister(AsyncWebServerRequest* request) {
+    String owner;
+    if (!requireValidDevice(request, owner)) return;
+    forwardToBackend(request, "POST", "/devices/register?device_id=" + owner);
+}
+
+void handleBackendRates(AsyncWebServerRequest* request) {
+    forwardToBackend(request, "GET", "/settings/public/1");
+}
+
+void handleBackendActive(AsyncWebServerRequest* request) {
+    String owner;
+    if (!requireValidDevice(request, owner)) return;
+    forwardToBackend(request, "GET", "/sessions/device/" + owner + "/active");
+}
+
+void handleBackendStart(AsyncWebServerRequest* request) {
+    updatePaymentWindow();
+    String owner;
+    if (!requireValidDevice(request, owner)) return;
+    const AsyncWebParameter* typeParameter = request->getParam("session_type");
+    uint32_t credits = 0;
+    if (!typeParameter || !readUnsignedParameter(request, "credits", credits) ||
+        (typeParameter->value() != "wifi" && typeParameter->value() != "charging")) {
+        sendResponse(request, 400, "application/json; charset=utf-8",
+                     "{\"detail\":\"Valid session_type and credits are required.\"}");
+        return;
+    }
+    if (!ownsPaymentCredits(owner)) {
+        sendResponse(request, 403, "application/json; charset=utf-8",
+                     "{\"detail\":\"These credits do not belong to this device.\"}");
+        return;
+    }
+    if (credits > coinCredits) {
+        sendResponse(request, 402, "application/json; charset=utf-8",
+                     "{\"detail\":\"There are not enough credits to start this session.\"}");
+        return;
+    }
+    String body = "{\"device_id\":\"" + owner + "\",\"session_type\":\"" +
+                  typeParameter->value() + "\",\"credits\":" + String(credits) + "}";
+    forwardToBackend(request, "POST", "/sessions/start", body);
+}
+
+void handleBackendSession(AsyncWebServerRequest* request) {
+    String owner;
+    if (!requireValidDevice(request, owner)) return;
+    const AsyncWebParameter* idParameter = request->getParam("id");
+    const AsyncWebParameter* actionParameter = request->getParam("action");
+    if (!idParameter || !actionParameter || idParameter->value().length() > 10 ||
+        !isSafeIdentifier(idParameter->value(), 10) ||
+        strspn(idParameter->value().c_str(), "0123456789") != idParameter->value().length() ||
+        (actionParameter->value() != "pause" && actionParameter->value() != "resume" &&
+         actionParameter->value() != "end")) {
+        sendResponse(request, 400, "application/json; charset=utf-8",
+                     "{\"detail\":\"A numeric id and a valid action are required.\"}");
+        return;
+    }
+    forwardToBackend(request, "PATCH",
+                     "/sessions/" + idParameter->value() + "/" + actionParameter->value() +
+                         "?device_id=" + owner);
+}
+
 void onWiFiEvent(WiFiEvent_t event) {
     if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
         upstreamConnected = true;
+        configTime(0, 0, "pool.ntp.org", "time.google.com");
 #if SUNSYNC_NAPT_AVAILABLE
         esp_netif_t* apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
         esp_netif_t* staNetif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -695,8 +864,6 @@ void refreshMeasurements() {
         panelReadings.powerW = NAN;
     }
 
-    if (panelLcdAvailable) writeLcd(panelLcd, "Panel", panelReadings);
-    if (batteryLcdAvailable) writeLcd(batteryLcd, "Battery", batteryReadings);
 }
 
 // Sensor 1 is the solar panel input and sensor 2 is the battery, matching the backend.
@@ -786,6 +953,12 @@ void startWebServer() {
     server.on("/api/service/resume", HTTP_POST, handleResumeService);
     server.on("/api/service/end", HTTP_POST, handleEndService);
     server.on("/api/health", HTTP_GET, handleHealth);
+    startBackendWorker();
+    server.on("/api/backend/register", HTTP_POST, handleBackendRegister);
+    server.on("/api/backend/rates", HTTP_GET, handleBackendRates);
+    server.on("/api/backend/active", HTTP_GET, handleBackendActive);
+    server.on("/api/backend/start", HTTP_POST, handleBackendStart);
+    server.on("/api/backend/session", HTTP_POST, handleBackendSession);
     server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
         serveLittleFsFile(request, "/index.html");
     });
@@ -856,6 +1029,14 @@ void setup() {
     lastSensorRefreshMs = millis();
     startNetwork();
 #if SUNSYNC_MQTT_ENABLED
+#if SUNSYNC_MQTT_TLS
+    if (strlen(SUNSYNC_MQTT_CA_CERT) > 0) {
+        mqttNetClient.setCACert(SUNSYNC_MQTT_CA_CERT);
+    } else {
+        Serial0.println("WARNING: MQTT TLS broker certificate is not verified (no CA set).");
+        mqttNetClient.setInsecure();
+    }
+#endif
     mqttClient.setServer(SUNSYNC_MQTT_HOST, SUNSYNC_MQTT_PORT);
 #endif
     startWebServer();
@@ -867,6 +1048,7 @@ void loop() {
     }
     updatePaymentWindow();
     updateServiceSession();
+    updateLcd();
     serviceMqtt();
 
     const uint32_t now = millis();

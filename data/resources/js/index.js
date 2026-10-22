@@ -1,7 +1,6 @@
-const API_BASE_URL = (typeof window.SUNSYNC_API_BASE === 'string'
-    ? window.SUNSYNC_API_BASE
-    : 'http://localhost:8000').replace(/\/$/, '');
 const DEVICE_API_BASE_URL = '';
+// All backend calls go through the ESP32, which adds the device key.
+const BACKEND_API_URL = `${DEVICE_API_BASE_URL}/api/backend`;
 const DEVICE_STORAGE_KEY = 'sunSyncDeviceId';
 const SETTINGS_ID = 1;
 const PAYMENT_POLL_INTERVAL_MS = 1000;
@@ -36,7 +35,7 @@ function getDeviceId() {
 async function registerDevice() {
 	const deviceId = getDeviceId();
 	const response = await fetch(
-		`${API_BASE_URL}/devices/register?device_id=${encodeURIComponent(deviceId)}`,
+		`${BACKEND_API_URL}/register?device_id=${encodeURIComponent(deviceId)}`,
 		{ method: 'POST' }
 	);
 
@@ -107,15 +106,23 @@ function renderSession(session) {
 		const progress = totalDuration > 0
 			? Math.min(100, Math.max(0, remaining / totalDuration * 100))
 			: 0;
-		const formattedRemaining = formatDuration(remaining);
-		sessionClockText.textContent = formattedRemaining;
-		sessionClock.style.setProperty('--timer-progress', `${progress}%`);
-		sessionClock.classList.toggle('is-paused', Boolean(activeSession.paused_at));
-		sessionClock.classList.toggle('is-active', !activeSession.paused_at);
-		sessionClock.setAttribute(
-			'aria-label',
-			`${activeSession.paused_at ? 'Paused' : 'Active'} ${activeSession.session_type} session, ${formattedRemaining} remaining`
-		);
+		// Only the Wi-Fi timer is shown here; the charging timer is on the station LCD.
+		if (activeSession.session_type === 'wifi') {
+			const formattedRemaining = formatDuration(remaining);
+			sessionClockText.textContent = formattedRemaining;
+			sessionClock.style.setProperty('--timer-progress', `${progress}%`);
+			sessionClock.classList.toggle('is-paused', Boolean(activeSession.paused_at));
+			sessionClock.classList.toggle('is-active', !activeSession.paused_at);
+			sessionClock.setAttribute(
+				'aria-label',
+				`${activeSession.paused_at ? 'Paused' : 'Active'} wifi session, ${formattedRemaining} remaining`
+			);
+		} else {
+			sessionClockText.textContent = '00:00:00';
+			sessionClock.style.setProperty('--timer-progress', '0%');
+			sessionClock.classList.remove('is-active', 'is-paused');
+			sessionClock.setAttribute('aria-label', 'No active Wi-Fi session');
+		}
 		if (remaining <= 0) {
 			renderSession(null);
 		}
@@ -186,7 +193,7 @@ function renderPaymentUnavailable(error) {
 }
 
 async function fetchRates() {
-	const response = await fetch(`${API_BASE_URL}/settings/public/${SETTINGS_ID}`);
+	const response = await fetch(`${BACKEND_API_URL}/rates`);
 	if (!response.ok) throw new Error(`Rates request failed (${response.status})`);
 	serviceRates = await response.json();
 	renderRates(serviceRates);
@@ -196,7 +203,7 @@ async function fetchRates() {
 async function fetchActiveSession() {
 	const deviceId = getDeviceId();
 	const response = await fetch(
-		`${API_BASE_URL}/sessions/device/${encodeURIComponent(deviceId)}/active`
+		`${BACKEND_API_URL}/active?device_id=${encodeURIComponent(deviceId)}`
 	);
 	if (!response.ok) throw new Error(`Session request failed (${response.status})`);
 	renderSession(await response.json());
@@ -252,8 +259,8 @@ async function toggleSessionPause() {
 		await requestDeviceService('pause', getDeviceId(), activeSession.session_type);
 	}
 	const response = await fetch(
-		`${API_BASE_URL}/sessions/${activeSession.id}/${action}?device_id=${deviceId}`,
-		{ method: 'PATCH' }
+		`${BACKEND_API_URL}/session?id=${activeSession.id}&action=${action}&device_id=${deviceId}`,
+		{ method: 'POST' }
 	);
 	if (!response.ok) {
 		if (action === 'pause') {
@@ -268,8 +275,8 @@ async function toggleSessionPause() {
 			await requestDeviceService('resume', getDeviceId(), updatedSession.session_type);
 		} catch (error) {
 			await fetch(
-				`${API_BASE_URL}/sessions/${updatedSession.id}/pause?device_id=${deviceId}`,
-				{ method: 'PATCH' }
+				`${BACKEND_API_URL}/session?id=${updatedSession.id}&action=pause&device_id=${deviceId}`,
+				{ method: 'POST' }
 			).catch(rollbackError =>
 				console.error('Could not pause backend session after device resume failed.', rollbackError)
 			);
@@ -321,14 +328,14 @@ async function startService(sessionType) {
 		const creditsToSpend = creditBalance;
 
 		const deviceId = getDeviceId();
-		const response = await fetch(`${API_BASE_URL}/sessions/start`, {
+		const startQuery = new URLSearchParams({
+			device_id: deviceId,
+			session_type: sessionType,
+			credits: String(creditsToSpend)
+		});
+		const response = await fetch(`${BACKEND_API_URL}/start?${startQuery}`, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				device_id: deviceId,
-				session_type: sessionType,
-				credits: creditsToSpend
-			})
+			cache: 'no-store'
 		});
 		if (!response.ok) {
 			let detail = `Could not start ${sessionType} session (${response.status})`;
@@ -390,8 +397,8 @@ async function startService(sessionType) {
 			try {
 				const deviceId = encodeURIComponent(getDeviceId());
 				const endResponse = await fetch(
-					`${API_BASE_URL}/sessions/${session.id}/end?device_id=${deviceId}`,
-					{ method: 'PATCH' }
+					`${BACKEND_API_URL}/session?id=${session.id}&action=end&device_id=${deviceId}`,
+					{ method: 'POST' }
 				);
 				if (!endResponse.ok) {
 					throw new Error(`Session cleanup failed (${endResponse.status})`);
