@@ -12,6 +12,9 @@ let coinInputEnabled = false;
 let creditBalance = 0;
 let serviceRates = null;
 let serviceActionPending = false;
+let paymentWindowActive = false;
+let serviceClock = null;
+let activeSessionRefreshPending = false;
 
 const payButton = document.querySelector('.btn-pay');
 const connectButton = document.querySelector('.btn-connect');
@@ -23,10 +26,20 @@ const actionStatusElement = document.querySelector('.action-status');
 const sessionClock = document.querySelector('.coin-status');
 const sessionClockText = document.querySelector('.coin-clock');
 
+function generateDeviceId() {
+	if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+	// crypto.randomUUID only exists on HTTPS/localhost; the portal is plain HTTP.
+	const bytes = crypto.getRandomValues(new Uint8Array(16));
+	bytes[6] = (bytes[6] & 0x0f) | 0x40;
+	bytes[8] = (bytes[8] & 0x3f) | 0x80;
+	const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function getDeviceId() {
 	let deviceId = localStorage.getItem(DEVICE_STORAGE_KEY);
 	if (!deviceId) {
-		deviceId = crypto.randomUUID();
+		deviceId = generateDeviceId();
 		localStorage.setItem(DEVICE_STORAGE_KEY, deviceId);
 	}
 	return deviceId;
@@ -66,6 +79,8 @@ function isSessionAvailable(session) {
 	if (!session || session.session_active !== true || !session.expires_at) {
 		return false;
 	}
+	// The board's own countdown wins over a phone clock that may be wrong.
+	if (serviceClock) return true;
 	return Boolean(session.paused_at) || Date.parse(session.expires_at) > Date.now();
 }
 
@@ -86,7 +101,12 @@ function renderSession(session) {
 
 	const updateTimer = () => {
 		let remaining;
-		if (activeSession?.paused_at) {
+		if (serviceClock && activeSession?.session_type === 'wifi') {
+			// Use the ESP32's own countdown so a wrong phone clock can't skew the timer.
+			remaining = serviceClock.paused
+				? serviceClock.seconds
+				: Math.max(0, serviceClock.seconds - (performance.now() - serviceClock.at) / 1000);
+		} else if (activeSession?.paused_at) {
 			remaining = Math.max(
 				0,
 				(Date.parse(activeSession.expires_at) - Date.parse(activeSession.paused_at)) / 1000
@@ -156,12 +176,30 @@ function renderPaymentStatus(status) {
 		? status.credits
 		: 0;
 	const windowActive = status.pay_window_active === true;
+	if (status.service_active === true && Number.isFinite(status.service_remaining_seconds)) {
+		serviceClock = {
+			seconds: status.service_remaining_seconds,
+			paused: status.service_paused === true,
+			at: performance.now()
+		};
+		// Restore the session view after a reconnect or reload that missed it.
+		if (!activeSession && !activeSessionRefreshPending) {
+			activeSessionRefreshPending = true;
+			fetchActiveSession()
+				.catch(console.error)
+				.finally(() => { activeSessionRefreshPending = false; });
+		}
+	} else {
+		serviceClock = null;
+	}
 	const secondsRemaining = Number.isSafeInteger(status.seconds_remaining)
 		? Math.max(0, status.seconds_remaining)
 		: 0;
 
 	creditBalanceElement.textContent = String(creditBalance);
-	payButton.disabled = !coinInputEnabled || windowActive;
+	paymentWindowActive = windowActive;
+	payButton.textContent = windowActive ? 'Stop' : 'Pay';
+	payButton.disabled = !coinInputEnabled;
 	updateServiceButtons();
 
 	if (!coinInputEnabled) {
@@ -225,17 +263,18 @@ async function openPaymentWindow() {
 	if (!paymentStateAvailable || !coinInputEnabled || payButton.disabled) {
 		return;
 	}
+	const action = paymentWindowActive ? 'close' : 'open';
 	payButton.disabled = true;
 	actionStatusElement.textContent = '';
 	try {
 		const deviceId = encodeURIComponent(getDeviceId());
 		const response = await fetch(
-			`${DEVICE_API_BASE_URL}/api/payment/open?device_id=${deviceId}`,
+			`${DEVICE_API_BASE_URL}/api/payment/${action}?device_id=${deviceId}`,
 			{ method: 'POST' }
 		);
 		if (!response.ok) {
 			const result = await response.json();
-			throw new Error(result.detail || `Could not open payment window (${response.status})`);
+			throw new Error(result.detail || `Could not ${action} payment window (${response.status})`);
 		}
 		renderPaymentStatus(await response.json());
 	} catch (error) {
@@ -317,7 +356,8 @@ async function startService(sessionType) {
 	let session = null;
 	let deviceMayHaveStarted = false;
 	try {
-		await registerDevice();
+		// The page already registered this device on load; a slow retry must not block payment.
+		await registerDevice().catch(error => console.warn(error));
 		await fetchPaymentStatus();
 		if (activeSession) {
 			throw new Error('End the active session before starting another one.');
@@ -348,9 +388,13 @@ async function startService(sessionType) {
 			throw new Error(detail);
 		}
 		session = await response.json();
-		const durationSeconds = Math.floor(
-			(Date.parse(session.expires_at) - Date.now()) / 1000
-		);
+		let durationSeconds = Number(session.duration_seconds);
+		if (!Number.isSafeInteger(durationSeconds) || durationSeconds <= 0) {
+			// Both timestamps come from the backend, so the phone's clock is not involved.
+			durationSeconds = Math.floor(
+				(Date.parse(session.expires_at) - Date.parse(session.session_start)) / 1000
+			);
+		}
 		if (!Number.isSafeInteger(session.id) ||
 			!Number.isSafeInteger(durationSeconds) || durationSeconds <= 0) {
 			throw new Error('Backend returned an invalid session duration.');

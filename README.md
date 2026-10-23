@@ -1,6 +1,6 @@
-# Sun Sync ESP32-S3 firmware
+﻿# Sun Sync ESP32-S3 firmware
 
-This PlatformIO project targets the ESP32-S3-DevKitC-1 with 16 MB flash and 8 MB PSRAM. It serves the existing `index.html`, `login.html`, and `dashboard.html` pages and their static files from LittleFS. The ESP32 exposes live, read-only battery and panel measurements at `GET /api/sensors`; authentication, settings, sessions, sales, and persistence remain backend responsibilities.
+This PlatformIO project targets the ESP32-S3-DevKitC-1 with 16 MB flash and 8 MB PSRAM. It serves the captive-portal `index.html` page and its static files from LittleFS. The login and admin dashboard are hosted by the Fly.io backend, and the kiosk pushes live state to it with `POST /devices/telemetry` every 15 s. The ESP32 exposes live, read-only battery and panel measurements at `GET /api/sensors`; authentication, settings, sessions, sales, and persistence remain backend responsibilities.
 
 ## Hardware defaults
 
@@ -55,9 +55,9 @@ pio run -t upload
 pio device monitor
 ```
 
-The platform pre-build script copies the three pages and `resources/` from the sibling `SunSync` project into `data/`. Set `SUNSYNC_WEB_ROOT` if the source project is elsewhere. If no source folder is present, the bundled `data/` copy is used. Re-upload the filesystem after changing web pages or assets.
+The pre-build script `scripts/gzip_web_assets.py` gzips the HTML, CSS and JS in `data/`. Re-upload the filesystem after changing portal assets.
 
-LittleFS must be uploaded before first boot. The custom 16 MB partition table reserves 5 MB for firmware and about 10.9 MiB for LittleFS, plus standard NVS and OTA metadata partitions. HTTP page routes include `/`, `/index.html`, `/login`, `/login.html`, `/dashboard`, and `/dashboard.html`.
+LittleFS must be uploaded before first boot. The custom 16 MB partition table reserves 5 MB for firmware and about 10.9 MiB for LittleFS, plus standard NVS and OTA metadata partitions. HTTP page routes are `/` and `/index.html`.
 
 ## Sensor API
 
@@ -65,7 +65,7 @@ LittleFS must be uploaded before first boot. The custom 16 MB partition table re
 
 The panel LCD (`0x27`) and battery LCD (`0x26`) each show the corresponding sensor's voltage and power on the first row and current on the second. A missing LCD is logged at startup and does not prevent the server or the other display from operating. Both LCD backpacks share the ESP32 I2C bus and must use the PCF8574-compatible backpack pin mapping expected by the `LiquidCrystal_PCF8574` driver.
 
-The web pages are served locally without depending on a CDN. HTTP is handled by ESPAsyncWebServer/AsyncTCP; sensor refresh and captive DNS remain lightweight loop/event work. HTML, CSS, and JavaScript are gzip-compressed during the PlatformIO build; the server negotiates gzip with browsers and allows static assets to be cached for an hour while revalidating HTML pages. Backend API base URLs retain the existing localhost setting during local development; device APIs use same-origin paths on the ESP32. The ESP32 does not implement login or backend session-creation routes.
+The web pages are served locally without depending on a CDN. HTTP is handled by ESPAsyncWebServer/AsyncTCP; sensor refresh and captive DNS remain lightweight loop/event work. HTML, CSS, and JavaScript are gzip-compressed during the PlatformIO build; the server negotiates gzip with browsers and allows static assets to be cached for an hour while revalidating HTML pages. Backend API base URLs retain the existing localhost setting during local development; device APIs use same-origin paths on the ESP32.
 
 ## Configuration
 

@@ -1,10 +1,10 @@
 #include <Adafruit_INA219.h>
 #include <Arduino.h>
 #include <AsyncTCP.h>
-#include <DNSServer.h>
+#include <WiFiUdp.h>
 #include <ESPAsyncWebServer.h>
 #include <esp_netif.h>
-#include <esp_netif_sta_list.h>
+#include <esp_wifi_ap_get_sta_list.h>
 #include <esp_wifi.h>
 #include <LittleFS.h>
 #include <HTTPClient.h>
@@ -14,8 +14,11 @@
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <lwip/opt.h>
-#if IP_NAPT && IP_FORWARD && ESP_L2_TO_L3_COPY
+#if IP_NAPT && IP_FORWARD
 #include <lwip/lwip_napt.h>
+#include <lwip/tcpip.h>
+#include <lwip/netif.h>
+#include <driver/gpio.h>
 #define SUNSYNC_NAPT_AVAILABLE 1
 #else
 #define SUNSYNC_NAPT_AVAILABLE 0
@@ -30,7 +33,6 @@ constexpr uint16_t DNS_PORT = 53;
 constexpr uint32_t SENSOR_REFRESH_INTERVAL_MS = 1000;
 constexpr uint32_t PAY_WINDOW_MS = 60000;
 AsyncWebServer server(HTTP_PORT);
-DNSServer dnsServer;
 Adafruit_INA219 batteryIna219(SUNSYNC_INA219_BATTERY_ADDRESS);
 Adafruit_INA219 panelIna219(SUNSYNC_INA219_PANEL_ADDRESS);
 LiquidCrystal_PCF8574 lcd(SUNSYNC_LCD_ADDRESS);
@@ -66,6 +68,7 @@ volatile uint32_t queuedCoinPulses = 0;
 volatile uint32_t lastCoinPulseUs = 0;
 bool coinInputEnabled = false;
 uint32_t coinCredits = 0;
+uint32_t coinPulseRemainder = 0;
 uint32_t payWindowEndsAt = 0;
 String payWindowOwner;
 bool serviceSessionActive = false;
@@ -75,25 +78,40 @@ uint32_t serviceSessionEndsAt = 0;
 uint32_t serviceSessionRemainingMs = 0;
 uint32_t serviceSessionCredits = 0;
 String serviceSessionOwner;
+uint32_t serviceSessionClientIp = 0;
+volatile int32_t serviceSessionBackendId = 0;  // backend row for the running session
+volatile bool usageBaselinePending = false;
+volatile uint32_t walledGardenIp = 0;  // backend address every client may reach (admin pages)
+String walledGardenHost;
+volatile uint32_t gateAllowedIp = 0;  // client IP allowed to resolve real DNS
 
-void setRelay(uint8_t pin, bool active) {
-    digitalWrite(pin, active ? SUNSYNC_RELAY_ACTIVE_LEVEL
-                             : !SUNSYNC_RELAY_ACTIVE_LEVEL);
+void setRelay(uint8_t pin, uint8_t onLevel, bool active) {
+    const uint32_t level = active ? onLevel : !onLevel;
+    gpio_set_level(static_cast<gpio_num_t>(pin), level);
+    Serial0.printf("Relay GPIO %u -> %u (readback %d)\n", pin, static_cast<unsigned>(level),
+                   gpio_get_level(static_cast<gpio_num_t>(pin)));
 }
 
+// Router idle/held level is HIGH and charger idle level is LOW (HIGH while charging).
 void initializeRelays() {
-    const uint8_t inactiveLevel = !SUNSYNC_RELAY_ACTIVE_LEVEL;
-    digitalWrite(SUNSYNC_ROUTER_RELAY_PIN, SUNSYNC_RELAY_ACTIVE_LEVEL);
-    digitalWrite(SUNSYNC_CHARGER_RELAY_PIN, inactiveLevel);
+    gpio_set_level(static_cast<gpio_num_t>(SUNSYNC_ROUTER_RELAY_PIN), SUNSYNC_ROUTER_RELAY_ON_LEVEL);
+    gpio_set_level(static_cast<gpio_num_t>(SUNSYNC_CHARGER_RELAY_PIN), !SUNSYNC_CHARGER_RELAY_ON_LEVEL);
     pinMode(SUNSYNC_ROUTER_RELAY_PIN, OUTPUT);
     pinMode(SUNSYNC_CHARGER_RELAY_PIN, OUTPUT);
-    setRelay(SUNSYNC_ROUTER_RELAY_PIN, true);
-    setRelay(SUNSYNC_CHARGER_RELAY_PIN, false);
     Serial0.println("Router relay held ON; charger relay initialized OFF.");
 }
-
 void setChargingRelay(bool active) {
-    setRelay(SUNSYNC_CHARGER_RELAY_PIN, active);
+    setRelay(SUNSYNC_CHARGER_RELAY_PIN, SUNSYNC_CHARGER_RELAY_ON_LEVEL, active);
+}
+
+void endLocalServiceSession() {
+    serviceSessionActive = false;
+    serviceSessionPaused = false;
+    serviceSessionIsCharging = false;
+    serviceSessionRemainingMs = 0;
+    serviceSessionCredits = 0;
+    serviceSessionOwner = "";
+    setChargingRelay(false);
 }
 
 void updateServiceSession() {
@@ -163,6 +181,8 @@ uint32_t serviceSessionRemainingSeconds() {
     return (remainingMs + 999) / 1000;
 }
 
+uint32_t paymentSecondsRemaining();
+
 void updateLcd() {
     if (!lcdAvailable) return;
 
@@ -174,8 +194,16 @@ void updateLcd() {
         lines[0] = "CURRENT CREDITS:";
         lines[1] = String(serviceSessionCredits);
     } else {
-        lines[0] = "INSERT COIN:";
-        lines[1] = String(coinCredits);
+        // Pulses are only counted while the pay window is open (see onCoinSignalPulse).
+        if (coinPayWindowOpen) {
+            char header[SUNSYNC_LCD_COLUMNS + 1];
+            snprintf(header, sizeof(header), "INSERT COIN %2lus",
+                     static_cast<unsigned long>(paymentSecondsRemaining()));
+            lines[0] = header;
+        } else {
+            lines[0] = "PRESS PAY BUTTON";
+        }
+        lines[1] = "CREDITS: " + String(coinCredits);
     }
 
     for (uint8_t row = 0; row < 2; ++row) {
@@ -226,13 +254,18 @@ void sendResponse(AsyncWebServerRequest* request, int status,
     request->send(response);
 }
 
+volatile uint32_t dbgRawEdges = 0;  // TEMP-DIAG
+volatile uint32_t dbgAcceptedPulses = 0;  // TEMP-DIAG
 void IRAM_ATTR onCoinSignalPulse() {
 #if SUNSYNC_COIN_SIGNAL_ENABLED
     const uint32_t now = micros();
+    dbgRawEdges = dbgRawEdges + 1;  // TEMP-DIAG
     portENTER_CRITICAL_ISR(&coinSignalMux);
-    if (coinPayWindowOpen &&
+    // Real pulses are still LOW here; noise spikes have already returned HIGH.
+    if (coinPayWindowOpen && digitalRead(SUNSYNC_COIN_SIGNAL_PIN) == LOW &&
         static_cast<uint32_t>(now - lastCoinPulseUs) >= SUNSYNC_COIN_PULSE_DEBOUNCE_US) {
         ++queuedCoinPulses;
+        dbgAcceptedPulses = dbgAcceptedPulses + 1;  // TEMP-DIAG
         lastCoinPulseUs = now;
     }
     portEXIT_CRITICAL_ISR(&coinSignalMux);
@@ -249,7 +282,10 @@ void updatePaymentWindow() {
     queuedCoinPulses = 0;
     portEXIT_CRITICAL(&coinSignalMux);
 
-    coinCredits += pulses;
+    // The acceptor sends several pulses per peso; keep leftover pulses for the next coin.
+    coinPulseRemainder += pulses;
+    coinCredits += coinPulseRemainder / SUNSYNC_COIN_PULSES_PER_PESO;
+    coinPulseRemainder %= SUNSYNC_COIN_PULSES_PER_PESO;
 }
 
 uint32_t paymentSecondsRemaining() {
@@ -269,12 +305,59 @@ bool ownsPaymentCredits(const String& owner) {
     return owner.length() > 0 && owner == payWindowOwner;
 }
 
+// Unspent credits are released if their owner's Wi-Fi client stays away this long.
+const uint32_t CREDIT_ORPHAN_GRACE_MS = 30000;
+uint8_t payOwnerMac[6] = {};
+bool payOwnerMacKnown = false;
+volatile uint32_t creditClearAtMs = 0;
+
+bool lookupStationMacByIp(uint32_t ip, uint8_t mac[6]) {
+    wifi_sta_list_t stations = {};
+    wifi_sta_mac_ip_list_t withIp = {};
+    if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK ||
+        esp_wifi_ap_get_sta_list_with_ip(&stations, &withIp) != ESP_OK) {
+        return false;
+    }
+    for (int i = 0; i < withIp.num; ++i) {
+        if (withIp.sta[i].ip.addr == ip) {
+            memcpy(mac, withIp.sta[i].mac, 6);
+            return true;
+        }
+    }
+    return false;
+}
+
+void releaseOrphanedCredits() {
+    if (creditClearAtMs == 0 || static_cast<int32_t>(millis() - creditClearAtMs) < 0) {
+        return;
+    }
+    creditClearAtMs = 0;
+    portENTER_CRITICAL(&coinSignalMux);
+    coinPayWindowOpen = false;
+    queuedCoinPulses = 0;
+    portEXIT_CRITICAL(&coinSignalMux);
+    coinCredits = 0;
+    payWindowOwner = "";
+    payOwnerMacKnown = false;
+}
+
 void handlePaymentStatus(AsyncWebServerRequest* request) {
     updatePaymentWindow();
     const String owner = requestedPaymentOwner(request);
     const bool ownsCredits = ownsPaymentCredits(owner);
+    const bool ownsService = serviceSessionActive && owner.length() > 0 &&
+                             owner == serviceSessionOwner;
+    const uint32_t clientIp = static_cast<uint32_t>(request->client()->remoteIP());
+    // A returning device (new IP/MAC after forgetting the network) re-binds by its device id.
+    if (ownsService) {
+        serviceSessionClientIp = clientIp;
+    }
+    if (ownsCredits) {
+        creditClearAtMs = 0;
+        payOwnerMacKnown = lookupStationMacByIp(clientIp, payOwnerMac);
+    }
     String response;
-    response.reserve(160);
+    response.reserve(260);
     response += "{\"coin_input_enabled\":";
     response += coinInputEnabled ? "true" : "false";
     response += ",\"pay_window_active\":";
@@ -283,8 +366,32 @@ void handlePaymentStatus(AsyncWebServerRequest* request) {
     response += coinPayWindowOpen && ownsCredits ? String(paymentSecondsRemaining()) : "0";
     response += ",\"credits\":";
     response += ownsCredits ? String(coinCredits) : "0";
+    response += ",\"service_active\":";
+    response += ownsService ? "true" : "false";
+    response += ",\"service_paused\":";
+    response += ownsService && serviceSessionPaused ? "true" : "false";
+    response += ",\"service_remaining_seconds\":";
+    response += ownsService ? String(serviceSessionRemainingSeconds()) : "0";
+    response += ",\"dbg_raw_edges\":" + String(dbgRawEdges) +  // TEMP-DIAG
+                ",\"dbg_accepted_pulses\":" + String(dbgAcceptedPulses);
     response += ",\"credit_unit\":\"coin_pulse\"}";
     sendResponse(request, 200, "application/json; charset=utf-8", response);
+}
+
+void closePaymentWindow() {
+    portENTER_CRITICAL(&coinSignalMux);
+    coinPayWindowOpen = false;
+    queuedCoinPulses = 0;
+    portEXIT_CRITICAL(&coinSignalMux);
+}
+
+void handleClosePaymentWindow(AsyncWebServerRequest* request) {
+    updatePaymentWindow();
+    const String owner = requestedPaymentOwner(request);
+    if (coinPayWindowOpen && ownsPaymentCredits(owner)) {
+        closePaymentWindow();
+    }
+    handlePaymentStatus(request);
 }
 
 void handleOpenPaymentWindow(AsyncWebServerRequest* request) {
@@ -313,6 +420,10 @@ void handleOpenPaymentWindow(AsyncWebServerRequest* request) {
     }
 
     payWindowOwner = owner;
+    payOwnerMacKnown = lookupStationMacByIp(
+        static_cast<uint32_t>(request->client()->remoteIP()), payOwnerMac);
+    creditClearAtMs = 0;
+    coinPulseRemainder = 0;
     payWindowEndsAt = millis() + PAY_WINDOW_MS;
     portENTER_CRITICAL(&coinSignalMux);
     queuedCoinPulses = 0;
@@ -382,10 +493,14 @@ void handleStartService(AsyncWebServerRequest* request) {
     }
 
     coinCredits -= creditsToSpend;
+    updatePaymentWindow();
+    closePaymentWindow();
     serviceSessionActive = true;
     serviceSessionPaused = false;
     serviceSessionIsCharging = sessionType == "charging";
     serviceSessionOwner = owner;
+    serviceSessionClientIp = static_cast<uint32_t>(request->client()->remoteIP());
+    usageBaselinePending = true;
     serviceSessionCredits = creditsToSpend;
     serviceSessionRemainingMs = durationSeconds * 1000UL;
     serviceSessionEndsAt = millis() + serviceSessionRemainingMs;
@@ -462,8 +577,6 @@ void handleEndService(AsyncWebServerRequest* request) {
 
 void serveLittleFsFile(AsyncWebServerRequest* request, String path) {
     if (path == "/") path = "/index.html";
-    if (path == "/login") path = "/login.html";
-    if (path == "/dashboard") path = "/dashboard.html";
 
     if (path.indexOf("..") >= 0 || path.indexOf('\\') >= 0) {
         sendResponse(request, 400, "text/plain; charset=utf-8", "Invalid path");
@@ -555,19 +668,121 @@ String formatMacAddress(const uint8_t* mac) {
     return String(formatted);
 }
 
-void handleWifiClients(AsyncWebServerRequest* request) {
+// Per-client traffic that crosses the AP (forwarded internet traffic only; the portal's own
+// pages to 192.168.4.1 are excluded). Counted by wrapping the AP netif input/output.
+struct ClientTraffic {
+    uint8_t mac[6];
+    uint64_t downBytes;
+    uint64_t upBytes;
+    bool used;
+};
+constexpr size_t MAX_TRAFFIC_CLIENTS = 8;
+ClientTraffic clientTraffic[MAX_TRAFFIC_CLIENTS];
+portMUX_TYPE trafficMux = portMUX_INITIALIZER_UNLOCKED;
+uint8_t trafficApIp[4] = {192, 168, 4, 1};
+netif_input_fn originalApInput = nullptr;
+netif_linkoutput_fn originalApLinkOutput = nullptr;
+
+void addClientTraffic(const uint8_t* mac, uint32_t bytes, bool download) {
+    portENTER_CRITICAL(&trafficMux);
+    ClientTraffic* slot = nullptr;
+    for (auto& entry : clientTraffic) {
+        if (entry.used && memcmp(entry.mac, mac, 6) == 0) { slot = &entry; break; }
+    }
+    if (!slot) {
+        for (auto& entry : clientTraffic) {
+            if (!entry.used) {
+                entry.used = true;
+                memcpy(entry.mac, mac, 6);
+                entry.downBytes = entry.upBytes = 0;
+                slot = &entry;
+                break;
+            }
+        }
+    }
+    if (slot) {
+        if (download) slot->downBytes += bytes; else slot->upBytes += bytes;
+    }
+    portEXIT_CRITICAL(&trafficMux);
+}
+
+bool getClientTraffic(const uint8_t* mac, uint64_t& down, uint64_t& up) {
+    bool found = false;
+    portENTER_CRITICAL(&trafficMux);
+    for (const auto& entry : clientTraffic) {
+        if (entry.used && memcmp(entry.mac, mac, 6) == 0) {
+            down = entry.downBytes;
+            up = entry.upBytes;
+            found = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&trafficMux);
+    return found;
+}
+
+err_t countingApInput(struct pbuf* p, struct netif* inp) {
+    if (p && p->len >= 34) {
+        const uint8_t* frame = static_cast<const uint8_t*>(p->payload);
+        const bool ipv4 = frame[12] == 0x08 && frame[13] == 0x00;
+        if (ipv4 && (frame[0] & 1) == 0 && memcmp(frame + 30, trafficApIp, 4) != 0) {
+            // Traffic leaving the AP is only forwarded for the client with an active, unpaused
+            // Wi-Fi session. Broadcast and multicast (DHCP, ARP-adjacent) are left alone.
+            uint32_t srcIp;
+            memcpy(&srcIp, frame + 26, 4);
+            const bool broadcastOrMulticast = frame[30] >= 224 || frame[33] == 255;
+            uint32_t dstIp;
+            memcpy(&dstIp, frame + 30, 4);
+            const bool toWalledGarden = walledGardenIp != 0 && dstIp == walledGardenIp;
+            if (!broadcastOrMulticast && !toWalledGarden &&
+                (gateAllowedIp == 0 || srcIp != gateAllowedIp)) {
+                pbuf_free(p);
+                return ERR_OK;
+            }
+            addClientTraffic(frame + 6, p->tot_len, false);
+        }
+    }
+    return originalApInput(p, inp);
+}
+
+err_t countingApLinkOutput(struct netif* netif, struct pbuf* p) {
+    if (p && p->len >= 34) {
+        const uint8_t* frame = static_cast<const uint8_t*>(p->payload);
+        const bool ipv4 = frame[12] == 0x08 && frame[13] == 0x00;
+        if (ipv4 && (frame[0] & 1) == 0 && memcmp(frame + 26, trafficApIp, 4) != 0) {
+            addClientTraffic(frame, p->tot_len, true);
+        }
+    }
+    return originalApLinkOutput(netif, p);
+}
+
+void installTrafficCounters() {
+    esp_netif_t* apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!apNetif) return;
+    const IPAddress apIp = WiFi.softAPIP();
+    for (int i = 0; i < 4; ++i) trafficApIp[i] = apIp[i];
+    LOCK_TCPIP_CORE();
+    struct netif* apLwipNetif = netif_get_by_index(esp_netif_get_netif_impl_index(apNetif));
+    if (apLwipNetif && apLwipNetif->input != countingApInput) {
+        originalApInput = apLwipNetif->input;
+        originalApLinkOutput = apLwipNetif->linkoutput;
+        apLwipNetif->input = countingApInput;
+        apLwipNetif->linkoutput = countingApLinkOutput;
+    }
+    UNLOCK_TCPIP_CORE();
+}
+
+// Appends the access-point clients as a JSON array for the telemetry report.
+void appendClientsJson(String& response) {
     wifi_sta_list_t associatedStations = {};
-    esp_netif_sta_list_t stationsWithIp = {};
+    wifi_sta_mac_ip_list_t stationsWithIp = {};
     if (esp_wifi_ap_get_sta_list(&associatedStations) != ESP_OK) {
-        sendResponse(request, 503, "application/json; charset=utf-8",
-                     "{\"detail\":\"Could not read AP station list.\"}");
+        response += "[]";
         return;
     }
-    const esp_err_t ipResult = esp_netif_get_sta_list(&associatedStations, &stationsWithIp);
-    String response;
-    response.reserve(128 + associatedStations.num * 128);
-    response = "{\"clients\":[";
+    const esp_err_t ipResult = esp_wifi_ap_get_sta_list_with_ip(&associatedStations, &stationsWithIp);
     bool first = true;
+    response += "[";
     for (int index = 0; index < associatedStations.num; ++index) {
         const wifi_sta_info_t& station = associatedStations.sta[index];
         if (!first) response += ",";
@@ -575,7 +790,7 @@ void handleWifiClients(AsyncWebServerRequest* request) {
         response += "{\"mac\":\"";
         response += formatMacAddress(station.mac);
         response += "\",\"rssi_dbm\":";
-        response += String(station.rssi);
+        response += String(static_cast<int>(station.rssi));
         response += ",\"ip\":\"";
         bool hasIp = false;
         if (ipResult == ESP_OK) {
@@ -588,12 +803,15 @@ void handleWifiClients(AsyncWebServerRequest* request) {
             }
         }
         if (!hasIp) response += "unknown";
-        response += "\",\"hostname\":null,\"downloaded_bytes\":null}";
+        uint64_t downBytes = 0, upBytes = 0;
+        getClientTraffic(station.mac, downBytes, upBytes);
+        response += "\",\"hostname\":null,\"downloaded_bytes\":";
+        response += String(static_cast<unsigned long long>(downBytes));
+        response += ",\"uploaded_bytes\":";
+        response += String(static_cast<unsigned long long>(upBytes));
+        response += "}";
     }
-    response += "],\"client_count\":";
-    response += String(associatedStations.num);
-    response += ",\"traffic_counters_available\":false}";
-    sendResponse(request, 200, "application/json; charset=utf-8", response);
+    response += "]";
 }
 
 void handleHealth(AsyncWebServerRequest* request) {
@@ -623,7 +841,7 @@ struct BackendJob {
     String body;
 };
 
-constexpr size_t BACKEND_QUEUE_LENGTH = 4;
+constexpr size_t BACKEND_QUEUE_LENGTH = 8;
 constexpr size_t BACKEND_MAX_RESPONSE_BYTES = 8192;
 QueueHandle_t backendQueue = nullptr;
 
@@ -640,6 +858,20 @@ bool isSafeIdentifier(const String& value, size_t maxLength) {
     return true;
 }
 
+// The telemetry reply lists every session the backend still considers active. If the admin
+// stopped ours from the cloud dashboard, the kiosk ends its local session as well.
+void endLocalSessionIfBackendClosed(const String& response) {
+    const int32_t id = serviceSessionBackendId;
+    if (!serviceSessionActive || id <= 0) return;
+    static const char key[] = "\"active_session_ids\":[";
+    const int listAt = response.indexOf(key);
+    if (listAt < 0) return;
+    const int listEnd = response.indexOf(']', listAt);
+    if (listEnd < 0) return;
+    const String list = "," + response.substring(listAt + strlen(key), listEnd) + ",";
+    if (list.indexOf("," + String(id) + ",") < 0) endLocalServiceSession();
+}
+
 void backendWorker(void*) {
     for (;;) {
         BackendJob* job = nullptr;
@@ -647,7 +879,17 @@ void backendWorker(void*) {
 
         int status = 502;
         String payload = "{\"detail\":\"The backend is unreachable.\"}";
+        String responseType = "application/json; charset=utf-8";
         if (upstreamConnected) {
+            static uint32_t lastResolveMs = 0;
+            if (walledGardenHost.length() > 0 &&
+                millis() - lastResolveMs > (walledGardenIp == 0 ? 5000u : 60000u)) {
+                IPAddress resolved;
+                if (WiFi.hostByName(walledGardenHost.c_str(), resolved) == 1) {
+                    walledGardenIp = static_cast<uint32_t>(resolved);
+                }
+                lastResolveMs = millis();
+            }
             WiFiClientSecure client;
             if (strlen(SUNSYNC_BACKEND_CA_CERT) > 0) {
                 client.setCACert(SUNSYNC_BACKEND_CA_CERT);
@@ -655,16 +897,29 @@ void backendWorker(void*) {
                 client.setInsecure();
             }
             HTTPClient http;
-            http.setConnectTimeout(8000);
-            http.setTimeout(8000);
+            const uint16_t timeoutMs = 15000;
+            http.setConnectTimeout(timeoutMs);
+            http.setTimeout(timeoutMs);
             if (http.begin(client, String(SUNSYNC_BACKEND_URL) + job->path)) {
                 http.addHeader("X-Device-Key", SUNSYNC_DEVICE_API_KEY);
-                if (job->body.length() > 0) http.addHeader("Content-Type", "application/json");
+                if (job->body.length() > 0) {
+                    http.addHeader("Content-Type", "application/json");
+                }
                 const int code = http.sendRequest(job->method.c_str(), job->body);
                 if (code > 0) {
                     String received = http.getString();
                     if (received.length() <= BACKEND_MAX_RESPONSE_BYTES) {
                         status = code;
+                        if (code >= 200 && code < 300 && job->method == "POST" &&
+                            job->path == "/sessions/start") {
+                            const int idAt = received.indexOf("\"id\":");
+                            if (idAt >= 0) {
+                                serviceSessionBackendId = received.substring(idAt + 5).toInt();
+                            }
+                        }
+                        if (code >= 200 && code < 300 && job->path == "/devices/telemetry") {
+                            endLocalSessionIfBackendClosed(received);
+                        }
                         payload = received.length() > 0 ? received : String("null");
                     }
                 } else {
@@ -675,14 +930,27 @@ void backendWorker(void*) {
             }
         }
         if (auto request = job->request.lock()) {
-            sendResponse(request.get(), status, "application/json; charset=utf-8", payload);
+            sendResponse(request.get(), status, responseType.c_str(), payload);
         }
         delete job;
     }
 }
 
+void initWalledGarden() {
+    String host = SUNSYNC_BACKEND_URL;
+    const int scheme = host.indexOf("://");
+    if (scheme >= 0) host = host.substring(scheme + 3);
+    const int slash = host.indexOf('/');
+    if (slash >= 0) host = host.substring(0, slash);
+    const int colon = host.indexOf(':');
+    if (colon >= 0) host = host.substring(0, colon);
+    host.toLowerCase();
+    walledGardenHost = host;
+}
+
 void startBackendWorker() {
     if (backendQueue) return;
+    initWalledGarden();
     backendQueue = xQueueCreate(BACKEND_QUEUE_LENGTH, sizeof(BackendJob*));
     xTaskCreate(backendWorker, "backend", 12288, nullptr, 1, nullptr);
 }
@@ -707,6 +975,90 @@ void forwardToBackend(AsyncWebServerRequest* request, const char* method,
         }
         delete job;
     }
+}
+
+// Reports the running Wi-Fi session's downloaded data to the backend every 30 s and once more
+// after it ends, so the dashboard can show usage per session.
+void reportSessionUsage() {
+    static uint8_t mac[6];
+    static bool macKnown = false;
+    static uint64_t baseline = 0, carry = 0;
+    static uint32_t lastReportMs = 0;
+    static String owner;
+
+    if (usageBaselinePending) {
+        usageBaselinePending = false;
+        carry = 0;
+        macKnown = false;
+        lastReportMs = millis();
+    }
+    const int32_t id = serviceSessionBackendId;
+    if (id <= 0) return;
+    const bool active = serviceSessionActive;
+    if (active && serviceSessionIsCharging) return;
+    if (!active && serviceSessionOwner.length() == 0 && owner.length() == 0) {
+        serviceSessionBackendId = 0;
+        return;
+    }
+    if (active) {
+        if (serviceSessionOwner.length() > 0) owner = serviceSessionOwner;
+        uint8_t current[6];
+        uint64_t down = 0, up = 0;
+        if (lookupStationMacByIp(serviceSessionClientIp, current) &&
+            (!macKnown || memcmp(current, mac, 6) != 0)) {
+            if (macKnown && getClientTraffic(mac, down, up) && down > baseline) {
+                carry += down - baseline;
+            }
+            memcpy(mac, current, 6);
+            baseline = getClientTraffic(mac, down, up) ? down : 0;
+            macKnown = true;
+        }
+        if (millis() - lastReportMs < 30000) return;
+    }
+    uint64_t total = carry, down = 0, up = 0;
+    if (macKnown && getClientTraffic(mac, down, up) && down > baseline) total += down - baseline;
+    const String path = "/sessions/" + String(id) + "/usage?device_id=" + owner +
+                        "&data_download_kb=" + String(static_cast<unsigned long>(total / 1024));
+    BackendJob* job = new BackendJob{AsyncWebServerRequestPtr(), "PATCH", path, String()};
+    if (xQueueSend(backendQueue, &job, 0) != pdTRUE) {
+        delete job;
+        return;
+    }
+    lastReportMs = millis();
+    if (!active) {
+        serviceSessionBackendId = 0;
+        owner = "";
+        macKnown = false;
+    }
+}
+
+// Pushes the kiosk's live state (health and connected clients) to the backend every 15 s so the
+// cloud dashboard can show it without reaching this device.
+void reportTelemetry() {
+    static uint32_t lastReportMs = 0;
+    const uint32_t now = millis();
+    if (!backendConfigured() || !backendQueue || !upstreamConnected) return;
+    if (now - lastReportMs < 15000 || uxQueueSpacesAvailable(backendQueue) < 2) return;
+    lastReportMs = now;
+
+    String deviceId = WiFi.macAddress();
+    deviceId.replace(":", "");
+    String body;
+    body.reserve(1024);
+    body = "{\"device_id\":\"sunsync-" + deviceId + "\",\"uptime_ms\":" + String(now) +
+           ",\"upstream_connected\":" + (upstreamConnected ? "true" : "false") +
+           ",\"internet_sharing_enabled\":" + (internetSharingEnabled ? "true" : "false") +
+           ",\"internet_sharing_supported\":" +
+#if SUNSYNC_NAPT_AVAILABLE
+           "true" +
+#else
+           "false" +
+#endif
+           ",\"clients\":";
+    appendClientsJson(body);
+    body += "}";
+    BackendJob* job = new BackendJob{AsyncWebServerRequestPtr(), "POST", "/devices/telemetry", body};
+    if (xQueueSend(backendQueue, &job, 0) != pdTRUE) delete job;
 }
 
 bool requireValidDevice(AsyncWebServerRequest* request, String& owner) {
@@ -750,6 +1102,9 @@ void handleBackendStart(AsyncWebServerRequest* request) {
                      "{\"detail\":\"These credits do not belong to this device.\"}");
         return;
     }
+    // Pressing Connect/Charge ends coin collection; count pulses already queued first.
+    updatePaymentWindow();
+    closePaymentWindow();
     if (credits > coinCredits) {
         sendResponse(request, 402, "application/json; charset=utf-8",
                      "{\"detail\":\"There are not enough credits to start this session.\"}");
@@ -779,33 +1134,46 @@ void handleBackendSession(AsyncWebServerRequest* request) {
                          "?device_id=" + owner);
 }
 
-void onWiFiEvent(WiFiEvent_t event) {
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+        if (payOwnerMacKnown && memcmp(info.wifi_ap_stadisconnected.mac, payOwnerMac, 6) == 0 &&
+            (coinCredits > 0 || coinPayWindowOpen)) {
+            creditClearAtMs = millis() + CREDIT_ORPHAN_GRACE_MS;
+        }
+    } else if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+        if (payOwnerMacKnown && memcmp(info.wifi_ap_staconnected.mac, payOwnerMac, 6) == 0) {
+            creditClearAtMs = 0;
+        }
+    }
     if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
         upstreamConnected = true;
         configTime(0, 0, "pool.ntp.org", "time.google.com");
 #if SUNSYNC_NAPT_AVAILABLE
         esp_netif_t* apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-        esp_netif_t* staNetif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         esp_netif_ip_info_t apInfo;
-        esp_netif_dns_info_t upstreamDns;
         bool apDnsConfigured = false;
-        if (apNetif && staNetif &&
-            esp_netif_get_ip_info(apNetif, &apInfo) == ESP_OK &&
-            esp_netif_get_dns_info(staNetif, ESP_NETIF_DNS_MAIN, &upstreamDns) == ESP_OK &&
+        if (apNetif && esp_netif_get_ip_info(apNetif, &apInfo) == ESP_OK &&
             esp_netif_dhcps_stop(apNetif) == ESP_OK) {
+            // Clients use the ESP32 as DNS so the session gate decides who can resolve names.
+            esp_netif_dns_info_t gateDns = {};
+            gateDns.ip.type = ESP_IPADDR_TYPE_V4;
+            gateDns.ip.u_addr.ip4.addr = apInfo.ip.addr;
             const esp_err_t dnsResult =
-                esp_netif_set_dns_info(apNetif, ESP_NETIF_DNS_MAIN, &upstreamDns);
+                esp_netif_set_dns_info(apNetif, ESP_NETIF_DNS_MAIN, &gateDns);
+            uint8_t offerDns = 2;
+            esp_netif_dhcps_option(apNetif, ESP_NETIF_OP_SET,
+                                   ESP_NETIF_DOMAIN_NAME_SERVER, &offerDns, sizeof(offerDns));
             const esp_err_t dhcpResult = esp_netif_dhcps_start(apNetif);
             apDnsConfigured = dnsResult == ESP_OK && dhcpResult == ESP_OK;
         }
         if (apDnsConfigured) {
+            LOCK_TCPIP_CORE();
             ip_napt_enable(apInfo.ip.addr, 1);
-            dnsServer.stop();
-            captivePortalActive = false;
+            UNLOCK_TCPIP_CORE();
             internetSharingEnabled = true;
-            Serial0.println("IPv4 NAT enabled for AP clients.");
+            Serial0.println("IPv4 NAT enabled; internet is gated by the session DNS.");
         } else {
-            Serial0.println("ERROR: Could not configure upstream DNS/NAT for AP clients.");
+            Serial0.println("ERROR: Could not configure DNS/NAT for AP clients.");
         }
 #else
         internetSharingEnabled = false;
@@ -817,7 +1185,9 @@ void onWiFiEvent(WiFiEvent_t event) {
         esp_netif_t* apNetif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
         esp_netif_ip_info_t apInfo;
         if (apNetif && esp_netif_get_ip_info(apNetif, &apInfo) == ESP_OK) {
+            LOCK_TCPIP_CORE();
             ip_napt_enable(apInfo.ip.addr, 0);
+            UNLOCK_TCPIP_CORE();
             esp_netif_dns_info_t apDns = {};
             apDns.ip.type = ESP_IPADDR_TYPE_V4;
             apDns.ip.u_addr.ip4.addr = apInfo.ip.addr;
@@ -829,13 +1199,7 @@ void onWiFiEvent(WiFiEvent_t event) {
 #endif
         upstreamConnected = false;
         internetSharingEnabled = false;
-        const IPAddress accessPointIp = WiFi.softAPIP();
-        if (accessPointIp) {
-            dnsServer.stop();
-            dnsServer.start(DNS_PORT, "*", accessPointIp);
-            captivePortalActive = true;
-        }
-        Serial0.println("Upstream Wi-Fi disconnected.");
+        Serial0.printf("Upstream Wi-Fi disconnected (reason %u).\n", info.wifi_sta_disconnected.reason);
     }
 }
 
@@ -904,6 +1268,114 @@ void serviceMqtt() {
     }
 #endif
 }
+// DNS for AP clients: only the client with an active Wi-Fi session gets real answers;
+// everyone else is pointed at the portal so browsing lands on the payment page.
+size_t buildPortalDnsReply(const uint8_t* query, size_t length, uint8_t* reply) {
+    if (length < 17 || (query[2] & 0x80) || query[4] != 0 || query[5] != 1) return 0;
+    size_t offset = 12;
+    while (offset < length && query[offset] != 0) offset += query[offset] + 1;
+    const size_t questionEnd = offset + 5;
+    if (questionEnd > length) return 0;
+    memcpy(reply, query, questionEnd);
+    const uint16_t queryType = (query[offset + 1] << 8) | query[offset + 2];
+
+    // Only the OS captive-portal probes get the portal address; other names fail fast.
+    String name;
+    for (size_t pos = 12; pos < offset && query[pos] != 0; pos += query[pos] + 1) {
+        if (name.length()) name += '.';
+        for (uint8_t i = 1; i <= query[pos] && pos + i < offset; ++i) {
+            name += static_cast<char>(tolower(query[pos + i]));
+        }
+    }
+    static const char* const probeNames[] = {
+        "connectivitycheck.gstatic.com", "connectivitycheck.android.com",
+        "clients3.google.com", "www.google.com", "captive.apple.com",
+        "www.msftconnecttest.com", "msftconnecttest.com", "dns.msftncsi.com",
+        "detectportal.firefox.com", "nmcheck.gnome.org", "network-test.debian.org"};
+    const uint32_t gardenIp = walledGardenIp;
+    const bool isGarden = gardenIp != 0 && name == walledGardenHost;
+    bool isProbe = false;
+    for (const char* probe : probeNames) {
+        if (name == probe) { isProbe = true; break; }
+    }
+    if (!isProbe && !isGarden) {
+        reply[2] = 0x81;
+        reply[3] = 0x83;  // NXDOMAIN
+        reply[6] = reply[7] = reply[8] = reply[9] = reply[10] = reply[11] = 0;
+        return questionEnd;
+    }
+
+    reply[2] = 0x81;
+    reply[3] = 0x80;
+    reply[6] = 0;
+    reply[7] = queryType == 1 ? 1 : 0;
+    reply[8] = reply[9] = reply[10] = reply[11] = 0;
+    size_t size = questionEnd;
+    if (queryType == 1) {
+        const IPAddress portalIp = isGarden ? IPAddress(gardenIp) : WiFi.softAPIP();
+        const uint8_t answer[] = {0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, static_cast<uint8_t>(isGarden ? 60 : 1), 0, 4,
+                                  portalIp[0], portalIp[1], portalIp[2], portalIp[3]};
+        memcpy(reply + size, answer, sizeof(answer));
+        size += sizeof(answer);
+    }
+    return size;
+}
+
+void gateDnsTask(void*) {
+    static uint8_t query[1232];
+    static uint8_t reply[1232];
+    WiFiUDP clientSocket;
+    WiFiUDP upstreamSocket;
+    clientSocket.begin(DNS_PORT);
+    upstreamSocket.begin(54053);
+    for (;;) {
+        const int length = clientSocket.parsePacket();
+        if (length <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        const IPAddress clientIp = clientSocket.remoteIP();
+        const uint16_t clientPort = clientSocket.remotePort();
+        if (length > static_cast<int>(sizeof(query))) {
+            clientSocket.flush();
+            continue;
+        }
+        clientSocket.read(query, length);
+
+        const uint32_t allowedIp = gateAllowedIp;
+        const IPAddress upstreamDns = WiFi.dnsIP();
+        size_t replySize = 0;
+        if (allowedIp != 0 && static_cast<uint32_t>(clientIp) == allowedIp &&
+            upstreamDns != IPAddress(0, 0, 0, 0)) {
+            upstreamSocket.beginPacket(upstreamDns, 53);
+            upstreamSocket.write(query, length);
+            upstreamSocket.endPacket();
+            const uint32_t deadline = millis() + 1500;
+            while (replySize == 0 && static_cast<int32_t>(deadline - millis()) > 0) {
+                const int answerLength = upstreamSocket.parsePacket();
+                if (answerLength <= 0) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
+                if (answerLength <= static_cast<int>(sizeof(reply))) {
+                    upstreamSocket.read(reply, answerLength);
+                    if (answerLength >= 2 && reply[0] == query[0] && reply[1] == query[1]) {
+                        replySize = answerLength;
+                    }
+                } else {
+                    upstreamSocket.flush();
+                }
+            }
+        } else {
+            replySize = buildPortalDnsReply(query, length, reply);
+        }
+        if (replySize > 0) {
+            clientSocket.beginPacket(clientIp, clientPort);
+            clientSocket.write(reply, replySize);
+            clientSocket.endPacket();
+        }
+    }
+}
 void startAccessPoint() {
     const String macAddress = WiFi.macAddress();
     String suffix = macAddress.substring(macAddress.length() - 8);
@@ -919,10 +1391,8 @@ void startAccessPoint() {
     }
 
     const IPAddress accessPointIp = WiFi.softAPIP();
-    if (!dnsServer.start(DNS_PORT, "*", accessPointIp)) {
-        Serial0.println("ERROR: Could not start captive portal DNS.");
-        return;
-    }
+    xTaskCreate(gateDnsTask, "gateDns", 6144, nullptr, 1, nullptr);
+    installTrafficCounters();
     captivePortalActive = true;
     Serial0.printf("Sun Sync access point: %s (%s)\n", accessPointSsid.c_str(),
                    password ? "password protected" : "open");
@@ -945,9 +1415,9 @@ void startNetwork() {
 
 void startWebServer() {
     server.on("/api/sensors", HTTP_GET, handleSensorData);
-    server.on("/api/wifi/clients", HTTP_GET, handleWifiClients);
     server.on("/api/payment/status", HTTP_GET, handlePaymentStatus);
     server.on("/api/payment/open", HTTP_POST, handleOpenPaymentWindow);
+    server.on("/api/payment/close", HTTP_POST, handleClosePaymentWindow);
     server.on("/api/service/start", HTTP_POST, handleStartService);
     server.on("/api/service/pause", HTTP_POST, handlePauseService);
     server.on("/api/service/resume", HTTP_POST, handleResumeService);
@@ -964,18 +1434,6 @@ void startWebServer() {
     });
     server.on("/index.html", HTTP_GET, [](AsyncWebServerRequest* request) {
         serveLittleFsFile(request, "/index.html");
-    });
-    server.on("/login", HTTP_GET, [](AsyncWebServerRequest* request) {
-        serveLittleFsFile(request, "/login.html");
-    });
-    server.on("/login.html", HTTP_GET, [](AsyncWebServerRequest* request) {
-        serveLittleFsFile(request, "/login.html");
-    });
-    server.on("/dashboard", HTTP_GET, [](AsyncWebServerRequest* request) {
-        serveLittleFsFile(request, "/dashboard.html");
-    });
-    server.on("/dashboard.html", HTTP_GET, [](AsyncWebServerRequest* request) {
-        serveLittleFsFile(request, "/dashboard.html");
     });
     server.on("/generate_204", HTTP_GET, redirectToPortal);
     server.on("/gen_204", HTTP_GET, redirectToPortal);
@@ -1017,9 +1475,15 @@ void setup() {
     initializeDisplays();
 
 #if SUNSYNC_COIN_SIGNAL_ENABLED
-    pinMode(SUNSYNC_COIN_SIGNAL_PIN, INPUT_PULLUP);
+#if SUNSYNC_COIN_SIGNAL_ACTIVE_HIGH
+    pinMode(SUNSYNC_COIN_SIGNAL_PIN, INPUT_PULLDOWN);
+    attachInterrupt(digitalPinToInterrupt(SUNSYNC_COIN_SIGNAL_PIN),
+                    onCoinSignalPulse, RISING);
+#else
+    pinMode(SUNSYNC_COIN_SIGNAL_PIN, INPUT);  // TEMP-TEST: no internal pull, external circuit drives the line
     attachInterrupt(digitalPinToInterrupt(SUNSYNC_COIN_SIGNAL_PIN),
                     onCoinSignalPulse, FALLING);
+#endif
     coinInputEnabled = true;
 #else
     Serial0.println("Coin signal input disabled; configure a safe 3.3 V interface first.");
@@ -1043,11 +1507,23 @@ void setup() {
 }
 
 void loop() {
-    if (captivePortalActive) {
-        dnsServer.processNextRequest();
+    {  // TEMP-DIAG
+        static uint32_t lastRaw = 0, lastAcc = 0, lastChange = 0;
+        if (dbgRawEdges != lastRaw || dbgAcceptedPulses != lastAcc) {
+            lastRaw = dbgRawEdges; lastAcc = dbgAcceptedPulses; lastChange = millis();
+        } else if (lastChange && millis() - lastChange > 1500) {
+            Serial0.printf("COIN raw_edges=%u accepted=%u credits=%u\n",
+                           (unsigned)lastRaw, (unsigned)lastAcc, (unsigned)coinCredits);
+            lastChange = 0;
+        }
     }
+    releaseOrphanedCredits();
     updatePaymentWindow();
     updateServiceSession();
+    reportSessionUsage();
+    reportTelemetry();
+    gateAllowedIp = (serviceSessionActive && !serviceSessionPaused && !serviceSessionIsCharging)
+        ? serviceSessionClientIp : 0;
     updateLcd();
     serviceMqtt();
 
