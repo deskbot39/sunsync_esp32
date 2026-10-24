@@ -4,6 +4,7 @@
 #include <WiFiUdp.h>
 #include <ESPAsyncWebServer.h>
 #include <esp_netif.h>
+#include <esp_task_wdt.h>
 #include <esp_wifi_ap_get_sta_list.h>
 #include <esp_wifi.h>
 #include <LittleFS.h>
@@ -1658,6 +1659,9 @@ void startWebServer() {
 
 }  // namespace
 
+void startWatchdog();
+void rebootIfUpstreamLostTooLong();
+
 void setup() {
     Serial0.begin(115200);
     initializeRelays();
@@ -1710,9 +1714,44 @@ void setup() {
     mqttClient.setServer(SUNSYNC_MQTT_HOST, SUNSYNC_MQTT_PORT);
 #endif
     startWebServer();
+    startWatchdog();
+}
+
+// A hung main loop reboots the board after WATCHDOG_TIMEOUT_MS. Relays default to the safe
+// state during the reset: charger off, router on.
+const uint32_t WATCHDOG_TIMEOUT_MS = 30000;
+// If the upstream Wi-Fi stays down this long, a reboot is the cheapest recovery. Idle boards
+// only, so paid credits and sessions are never thrown away, and never while the admin has the
+// router deliberately off.
+const uint32_t UPSTREAM_LOSS_REBOOT_MS = 15UL * 60UL * 1000UL;
+
+void startWatchdog() {
+    esp_task_wdt_config_t config = {};
+    config.timeout_ms = WATCHDOG_TIMEOUT_MS;
+    config.idle_core_mask = 0;
+    config.trigger_panic = true;
+    if (esp_task_wdt_reconfigure(&config) != ESP_OK) esp_task_wdt_init(&config);
+    esp_task_wdt_add(nullptr);
+}
+
+void rebootIfUpstreamLostTooLong() {
+    static uint32_t lostSinceMs = 0;
+    const bool idle = coinCredits == 0 && !coinPayWindowOpen && !serviceSessionActive;
+    if (upstreamConnected || routerCutActive || !idle) {
+        lostSinceMs = 0;
+        return;
+    }
+    if (lostSinceMs == 0) lostSinceMs = millis() | 1;
+    if (millis() - lostSinceMs >= UPSTREAM_LOSS_REBOOT_MS) {
+        Serial0.println("Upstream Wi-Fi lost for too long; rebooting.");
+        delay(100);
+        esp_restart();
+    }
 }
 
 void loop() {
+    esp_task_wdt_reset();
+    rebootIfUpstreamLostTooLong();
     releaseOrphanedCredits();
     updatePaymentWindow();
     updateServiceSession();
