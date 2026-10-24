@@ -58,6 +58,33 @@ struct Ina219Readings {
 };
 
 Ina219Readings batteryReadings;
+
+// Sliding window of the last 10 one-second readings; MQTT publishes their plain average.
+constexpr uint8_t AVERAGE_WINDOW = 10;
+struct RunningAverage {
+    float voltage[AVERAGE_WINDOW] = {};
+    float current[AVERAGE_WINDOW] = {};
+    uint8_t next = 0;
+    uint8_t count = 0;
+
+    void add(float v, float ma) {
+        if (isnan(v) || isnan(ma)) return;
+        voltage[next] = v;
+        current[next] = ma;
+        next = (next + 1) % AVERAGE_WINDOW;
+        if (count < AVERAGE_WINDOW) ++count;
+    }
+    bool average(float& v, float& ma) const {
+        if (count == 0) return false;
+        float vSum = 0, cSum = 0;
+        for (uint8_t i = 0; i < count; ++i) { vSum += voltage[i]; cSum += current[i]; }
+        v = vSum / count;
+        ma = cSum / count;
+        return true;
+    }
+};
+RunningAverage batteryAverage;
+RunningAverage panelAverage;
 Ina219Readings panelReadings;
 bool lcdAvailable = false;
 String lcdLastLines[2];
@@ -68,6 +95,7 @@ volatile uint32_t queuedCoinPulses = 0;
 volatile uint32_t lastCoinPulseUs = 0;
 bool coinInputEnabled = false;
 uint32_t coinCredits = 0;
+uint32_t lastCreditAtMs = 0;
 uint32_t coinPulseRemainder = 0;
 uint32_t payWindowEndsAt = 0;
 String payWindowOwner;
@@ -80,6 +108,10 @@ uint32_t serviceSessionCredits = 0;
 String serviceSessionOwner;
 uint32_t serviceSessionClientIp = 0;
 volatile int32_t serviceSessionBackendId = 0;  // backend row for the running session
+// A backend session row is created before the local start; it is only adopted once the local
+// start for the same device succeeds, so a rejected start cannot hijack the running session.
+volatile int32_t pendingBackendId = 0;
+String pendingBackendOwner;
 volatile bool usageBaselinePending = false;
 volatile uint32_t walledGardenIp = 0;  // backend address every client may reach (admin pages)
 String walledGardenHost;
@@ -102,6 +134,31 @@ void initializeRelays() {
 }
 void setChargingRelay(bool active) {
     setRelay(SUNSYNC_CHARGER_RELAY_PIN, SUNSYNC_CHARGER_RELAY_ON_LEVEL, active);
+}
+
+// The admin can cut the router's power from the cloud dashboard. The backend sends the seconds
+// left; the kiosk keeps its own deadline because it cannot reach the backend while the router
+// is off.
+volatile bool routerCutActive = false;
+volatile uint32_t routerCutEndsAtMs = 0;
+
+void setRouterCut(uint32_t secondsLeft) {
+    if (secondsLeft > 0) {
+        routerCutEndsAtMs = millis() + secondsLeft * 1000UL;
+        if (!routerCutActive) {
+            routerCutActive = true;
+            setRelay(SUNSYNC_ROUTER_RELAY_PIN, SUNSYNC_ROUTER_RELAY_ON_LEVEL, false);
+        }
+    } else if (routerCutActive) {
+        routerCutActive = false;
+        setRelay(SUNSYNC_ROUTER_RELAY_PIN, SUNSYNC_ROUTER_RELAY_ON_LEVEL, true);
+    }
+}
+
+void updateRouterCut() {
+    if (routerCutActive && static_cast<int32_t>(millis() - routerCutEndsAtMs) >= 0) {
+        setRouterCut(0);
+    }
 }
 
 void endLocalServiceSession() {
@@ -317,6 +374,7 @@ void updatePaymentWindow() {
     if (burst > 0) {
         const uint32_t credits = (burst + SUNSYNC_COIN_PULSES_PER_PESO / 2) / SUNSYNC_COIN_PULSES_PER_PESO;
         coinCredits += credits > 0 ? credits : 1;
+        lastCreditAtMs = millis();
         if (coinBurstLogCount == COIN_BURST_LOG) {
             memmove(coinBurstLog, coinBurstLog + 1, sizeof(coinBurstLog) - sizeof(coinBurstLog[0]));
             --coinBurstLogCount;
@@ -344,6 +402,7 @@ bool ownsPaymentCredits(const String& owner) {
 
 // Unspent credits are released if their owner's Wi-Fi client stays away this long.
 const uint32_t CREDIT_ORPHAN_GRACE_MS = 30000;
+const uint32_t CREDIT_IDLE_EXPIRY_MS = 300000;
 uint8_t payOwnerMac[6] = {};
 bool payOwnerMacKnown = false;
 volatile uint32_t creditClearAtMs = 0;
@@ -364,11 +423,12 @@ bool lookupStationMacByIp(uint32_t ip, uint8_t mac[6]) {
     return false;
 }
 
-void releaseOrphanedCredits() {
-    if (creditClearAtMs == 0 || static_cast<int32_t>(millis() - creditClearAtMs) < 0) {
-        return;
+void queueForfeit(const String& owner, uint32_t credits);
+
+void clearCredits() {
+    if (coinCredits > 0 && payWindowOwner.length() > 0) {
+        queueForfeit(payWindowOwner, coinCredits);
     }
-    creditClearAtMs = 0;
     portENTER_CRITICAL(&coinSignalMux);
     coinPayWindowOpen = false;
     queuedCoinPulses = 0;
@@ -376,6 +436,22 @@ void releaseOrphanedCredits() {
     coinCredits = 0;
     payWindowOwner = "";
     payOwnerMacKnown = false;
+}
+
+// Unspent credits are forfeited (and recorded as a sale) when the owner leaves or stops using
+// them for CREDIT_IDLE_EXPIRY_MS.
+void releaseOrphanedCredits() {
+    if (coinCredits > 0 && !coinPayWindowOpen && !serviceSessionActive &&
+        millis() - lastCreditAtMs >= CREDIT_IDLE_EXPIRY_MS) {
+        creditClearAtMs = 0;
+        clearCredits();
+        return;
+    }
+    if (creditClearAtMs == 0 || static_cast<int32_t>(millis() - creditClearAtMs) < 0) {
+        return;
+    }
+    creditClearAtMs = 0;
+    clearCredits();
 }
 
 void handlePaymentStatus(AsyncWebServerRequest* request) {
@@ -540,6 +616,9 @@ void handleStartService(AsyncWebServerRequest* request) {
     serviceSessionOwner = owner;
     serviceSessionClientIp = static_cast<uint32_t>(request->client()->remoteIP());
     usageBaselinePending = true;
+    serviceSessionBackendId = (pendingBackendId > 0 && pendingBackendOwner == owner)
+        ? pendingBackendId : 0;
+    pendingBackendId = 0;
     serviceSessionCredits = creditsToSpend;
     serviceSessionRemainingMs = durationSeconds * 1000UL;
     serviceSessionEndsAt = millis() + serviceSessionRemainingMs;
@@ -888,6 +967,13 @@ bool backendConfigured() {
     return strlen(SUNSYNC_BACKEND_URL) > 0 && strlen(SUNSYNC_DEVICE_API_KEY) > 0;
 }
 
+void queueForfeit(const String& owner, uint32_t credits) {
+    if (!backendConfigured() || !backendQueue || owner.length() > 100) return;
+    const String body = "{\"device_id\":\"" + owner + "\",\"credits\":" + String(credits) + "}";
+    BackendJob* job = new BackendJob{AsyncWebServerRequestPtr(), "POST", "/sessions/forfeit", body};
+    if (xQueueSend(backendQueue, &job, 0) != pdTRUE) delete job;
+}
+
 bool isSafeIdentifier(const String& value, size_t maxLength) {
     if (value.length() == 0 || value.length() > maxLength) return false;
     for (size_t i = 0; i < value.length(); ++i) {
@@ -909,6 +995,14 @@ void endLocalSessionIfBackendClosed(const String& response) {
     if (listEnd < 0) return;
     const String list = "," + response.substring(listAt + strlen(key), listEnd) + ",";
     if (list.indexOf("," + String(id) + ",") < 0) endLocalServiceSession();
+}
+
+void applyRouterCommand(const String& response) {
+    static const char key[] = "\"router_off_seconds\":";
+    const int at = response.indexOf(key);
+    if (at < 0) return;
+    const long seconds = response.substring(at + strlen(key)).toInt();
+    setRouterCut(seconds > 0 ? static_cast<uint32_t>(seconds) : 0);
 }
 
 void backendWorker(void*) {
@@ -953,11 +1047,20 @@ void backendWorker(void*) {
                             job->path == "/sessions/start") {
                             const int idAt = received.indexOf("\"id\":");
                             if (idAt >= 0) {
-                                serviceSessionBackendId = received.substring(idAt + 5).toInt();
+                                const int32_t newId = received.substring(idAt + 5).toInt();
+                                String newOwner;
+                                const int devAt = received.indexOf("\"device_id\":\"");
+                                if (devAt >= 0) {
+                                    const int from = devAt + 13;
+                                    newOwner = received.substring(from, received.indexOf('"', from));
+                                }
+                                pendingBackendOwner = newOwner;
+                                pendingBackendId = newId;
                             }
                         }
                         if (code >= 200 && code < 300 && job->path == "/devices/telemetry") {
                             endLocalSessionIfBackendClosed(received);
+                            applyRouterCommand(received);
                         }
                         payload = received.length() > 0 ? received : String("null");
                     }
@@ -1094,8 +1197,9 @@ void reportTelemetry() {
            "false" +
 #endif
            ",\"clients\":";
-    appendClientsJson(body);
-    body += "}";
+     appendClientsJson(body);
+     body += ",\"local_session_id\":" +
+            String(serviceSessionActive ? static_cast<long>(serviceSessionBackendId) : 0L) + "}";
     BackendJob* job = new BackendJob{AsyncWebServerRequestPtr(), "POST", "/devices/telemetry", body};
     if (xQueueSend(backendQueue, &job, 0) != pdTRUE) delete job;
 }
@@ -1242,6 +1346,15 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     }
 }
 
+// The window keeps raw samples; the displayed readings use their average.
+void smoothReadings(Ina219Readings& readings, const RunningAverage& average) {
+    float voltage, currentMa;
+    if (!readings.available || !average.average(voltage, currentMa)) return;
+    readings.busVoltageV = voltage;
+    readings.currentMa = currentMa;
+    readings.powerW = voltage * currentMa / 1000.0f;
+}
+
 void refreshMeasurements() {
     if (batteryReadings.available) {
         batteryReadings.busVoltageV = batteryIna219.getBusVoltage_V();
@@ -1266,20 +1379,21 @@ void refreshMeasurements() {
         panelReadings.currentMa = NAN;
         panelReadings.powerW = NAN;
     }
-
+    batteryAverage.add(batteryReadings.busVoltageV, batteryReadings.currentMa);
+    panelAverage.add(panelReadings.busVoltageV, panelReadings.currentMa);
+    smoothReadings(batteryReadings, batteryAverage);
+    smoothReadings(panelReadings, panelAverage);
 }
 
 // Sensor 1 is the solar panel input and sensor 2 is the battery, matching the backend.
-void publishIna219(uint8_t sensorId, const Ina219Readings& readings) {
-    if (!readings.available || isnan(readings.busVoltageV) ||
-        isnan(readings.currentMa)) {
-        return;
-    }
+void publishIna219(uint8_t sensorId, const RunningAverage& average) {
+    float voltage, currentMa;
+    if (!average.average(voltage, currentMa)) return;
     char topic[64];
     snprintf(topic, sizeof(topic), "%s/ina219/%u", SUNSYNC_MQTT_TOPIC_PREFIX, sensorId);
     char payload[80];
     snprintf(payload, sizeof(payload), "{\"voltage_v\":%.3f,\"current_a\":%.4f}",
-             readings.busVoltageV, readings.currentMa / 1000.0f);
+             voltage, currentMa / 1000.0f);
     mqttClient.publish(topic, payload);
 }
 
@@ -1302,8 +1416,8 @@ void serviceMqtt() {
     mqttClient.loop();
     if (now - lastMqttPublishMs >= SUNSYNC_MQTT_PUBLISH_INTERVAL_MS) {
         lastMqttPublishMs = now;
-        publishIna219(1, panelReadings);
-        publishIna219(2, batteryReadings);
+        publishIna219(1, panelAverage);
+        publishIna219(2, batteryAverage);
     }
 #endif
 }
@@ -1416,9 +1530,13 @@ void gateDnsTask(void*) {
     }
 }
 void startAccessPoint() {
-    const String macAddress = WiFi.macAddress();
-    String suffix = macAddress.substring(macAddress.length() - 8);
-    suffix.replace(":", "");
+    // Read the MAC from the chip; WiFi.macAddress() can return zeros this early in start-up.
+    const uint64_t chipMac = ESP.getEfuseMac();
+    char suffix[7];
+    snprintf(suffix, sizeof(suffix), "%02X%02X%02X",
+             static_cast<unsigned>((chipMac >> 24) & 0xFF),
+             static_cast<unsigned>((chipMac >> 32) & 0xFF),
+             static_cast<unsigned>((chipMac >> 40) & 0xFF));
     accessPointSsid = String(SUNSYNC_AP_SSID) + "-" + suffix;
     const char* password = strlen(SUNSYNC_AP_PASSWORD) >= 8
         ? SUNSYNC_AP_PASSWORD
@@ -1546,6 +1664,7 @@ void loop() {
     releaseOrphanedCredits();
     updatePaymentWindow();
     updateServiceSession();
+    updateRouterCut();
     reportSessionUsage();
     reportTelemetry();
     gateAllowedIp = (serviceSessionActive && !serviceSessionPaused && !serviceSessionIsCharging)

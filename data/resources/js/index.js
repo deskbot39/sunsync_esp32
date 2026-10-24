@@ -385,6 +385,9 @@ async function startService(sessionType) {
 			} catch (error) {
 				console.error(error);
 			}
+			if (response.status === 409) {
+				fetchActiveSession().catch(error => console.warn(error));
+			}
 			throw new Error(detail);
 		}
 		session = await response.json();
