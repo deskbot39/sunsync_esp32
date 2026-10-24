@@ -187,23 +187,24 @@ void updateLcd() {
     if (!lcdAvailable) return;
 
     String lines[2];
-    if (serviceSessionActive && serviceSessionIsCharging) {
-        lines[0] = "CHARGING TIME:";
-        lines[1] = formatLcdClock(serviceSessionRemainingSeconds());
-    } else if (serviceSessionActive) {
-        lines[0] = "CURRENT CREDITS:";
-        lines[1] = String(serviceSessionCredits);
-    } else {
-        // Pulses are only counted while the pay window is open (see onCoinSignalPulse).
+    // Coin feedback comes first: the slot serves one payer at a time, so these credits are theirs.
+    // Wi-Fi sessions are not shown here because several users share the display.
+    if (coinPayWindowOpen || coinCredits > 0) {
         if (coinPayWindowOpen) {
             char header[SUNSYNC_LCD_COLUMNS + 1];
             snprintf(header, sizeof(header), "INSERT COIN %2lus",
                      static_cast<unsigned long>(paymentSecondsRemaining()));
             lines[0] = header;
         } else {
-            lines[0] = "PRESS PAY BUTTON";
+            lines[0] = "CREDITS PENDING";
         }
         lines[1] = "CREDITS: " + String(coinCredits);
+    } else if (serviceSessionActive && serviceSessionIsCharging) {
+        lines[0] = "CHARGING TIME:";
+        lines[1] = formatLcdClock(serviceSessionRemainingSeconds());
+    } else {
+        lines[0] = "PRESS PAY BUTTON";
+        lines[1] = "ON YOUR PHONE";
     }
 
     for (uint8_t row = 0; row < 2; ++row) {
@@ -254,38 +255,74 @@ void sendResponse(AsyncWebServerRequest* request, int status,
     request->send(response);
 }
 
-volatile uint32_t dbgRawEdges = 0;  // TEMP-DIAG
-volatile uint32_t dbgAcceptedPulses = 0;  // TEMP-DIAG
-void IRAM_ATTR onCoinSignalPulse() {
-#if SUNSYNC_COIN_SIGNAL_ENABLED
-    const uint32_t now = micros();
-    dbgRawEdges = dbgRawEdges + 1;  // TEMP-DIAG
-    portENTER_CRITICAL_ISR(&coinSignalMux);
-    // Real pulses are still LOW here; noise spikes have already returned HIGH.
-    if (coinPayWindowOpen && digitalRead(SUNSYNC_COIN_SIGNAL_PIN) == LOW &&
-        static_cast<uint32_t>(now - lastCoinPulseUs) >= SUNSYNC_COIN_PULSE_DEBOUNCE_US) {
-        ++queuedCoinPulses;
-        dbgAcceptedPulses = dbgAcceptedPulses + 1;  // TEMP-DIAG
-        lastCoinPulseUs = now;
-    }
-    portEXIT_CRITICAL_ISR(&coinSignalMux);
-#endif
-}
+// The acceptor sends one burst of pulses per coin. A burst ends after a quiet gap and is then
+// converted to credits as a whole, so a coin is never split across two readings.
+constexpr uint32_t COIN_BURST_GAP_US = 400000;
+constexpr uint8_t COIN_BURST_LOG = 8;
+uint16_t coinBurstLog[COIN_BURST_LOG] = {};
+uint8_t coinBurstLogCount = 0;
 
+// The acceptor pin is sampled every millisecond instead of using edge interrupts, so closely
+// spaced pulses from fast coin drops cannot be lost. A pulse counts only if the line stays active
+// for 20-250 ms; the last pulse widths are kept for diagnosis.
+constexpr uint32_t COIN_MIN_PULSE_MS = 20;
+constexpr uint32_t COIN_MAX_PULSE_MS = 250;
+constexpr uint32_t COIN_RELEASE_MS = 5;
+constexpr uint8_t COIN_WIDTH_LOG = 16;
+volatile uint16_t coinWidthLogMs[COIN_WIDTH_LOG] = {};
+volatile uint8_t coinWidthLogNext = 0;
+
+void coinSamplerTask(void*) {
+    bool inPulse = false;
+    uint32_t startMs = 0, lastActiveMs = 0;
+    for (;;) {
+        vTaskDelay(1);
+        const uint32_t nowMs = millis();
+        const bool active =
+            digitalRead(SUNSYNC_COIN_SIGNAL_PIN) == (SUNSYNC_COIN_SIGNAL_ACTIVE_HIGH ? HIGH : LOW);
+        if (active) {
+            if (!inPulse) {
+                inPulse = true;
+                startMs = nowMs;
+            }
+            lastActiveMs = nowMs;
+        } else if (inPulse && nowMs - lastActiveMs >= COIN_RELEASE_MS) {
+            inPulse = false;
+            const uint32_t width = lastActiveMs - startMs + 1;
+            portENTER_CRITICAL(&coinSignalMux);
+            coinWidthLogMs[coinWidthLogNext] = static_cast<uint16_t>(width > 65535 ? 65535 : width);
+            coinWidthLogNext = (coinWidthLogNext + 1) % COIN_WIDTH_LOG;
+            if (coinPayWindowOpen && width >= COIN_MIN_PULSE_MS && width <= COIN_MAX_PULSE_MS) {
+                ++queuedCoinPulses;
+                lastCoinPulseUs = micros();
+            }
+            portEXIT_CRITICAL(&coinSignalMux);
+        }
+    }
+}
 void updatePaymentWindow() {
     const uint32_t now = millis();
+    uint32_t burst = 0;
     portENTER_CRITICAL(&coinSignalMux);
     if (coinPayWindowOpen && static_cast<int32_t>(now - payWindowEndsAt) >= 0) {
         coinPayWindowOpen = false;
     }
-    const uint32_t pulses = queuedCoinPulses;
-    queuedCoinPulses = 0;
+    if (queuedCoinPulses > 0 &&
+        static_cast<uint32_t>(micros() - lastCoinPulseUs) >= COIN_BURST_GAP_US) {
+        burst = queuedCoinPulses;
+        queuedCoinPulses = 0;
+    }
     portEXIT_CRITICAL(&coinSignalMux);
 
-    // The acceptor sends several pulses per peso; keep leftover pulses for the next coin.
-    coinPulseRemainder += pulses;
-    coinCredits += coinPulseRemainder / SUNSYNC_COIN_PULSES_PER_PESO;
-    coinPulseRemainder %= SUNSYNC_COIN_PULSES_PER_PESO;
+    if (burst > 0) {
+        const uint32_t credits = (burst + SUNSYNC_COIN_PULSES_PER_PESO / 2) / SUNSYNC_COIN_PULSES_PER_PESO;
+        coinCredits += credits > 0 ? credits : 1;
+        if (coinBurstLogCount == COIN_BURST_LOG) {
+            memmove(coinBurstLog, coinBurstLog + 1, sizeof(coinBurstLog) - sizeof(coinBurstLog[0]));
+            --coinBurstLogCount;
+        }
+        coinBurstLog[coinBurstLogCount++] = static_cast<uint16_t>(burst);
+    }
 }
 
 uint32_t paymentSecondsRemaining() {
@@ -372,9 +409,11 @@ void handlePaymentStatus(AsyncWebServerRequest* request) {
     response += ownsService && serviceSessionPaused ? "true" : "false";
     response += ",\"service_remaining_seconds\":";
     response += ownsService ? String(serviceSessionRemainingSeconds()) : "0";
-    response += ",\"dbg_raw_edges\":" + String(dbgRawEdges) +  // TEMP-DIAG
-                ",\"dbg_accepted_pulses\":" + String(dbgAcceptedPulses);
-    response += ",\"credit_unit\":\"coin_pulse\"}";
+    response += ",\"recent_coin_pulse_counts\":[";
+    for (uint8_t i = 0; i < coinBurstLogCount; ++i) response += (i ? "," : "") + String(coinBurstLog[i]);
+    response += "],\"recent_pulse_widths_ms\":[";
+    for (uint8_t i = 0; i < COIN_WIDTH_LOG; ++i) response += (i ? "," : "") + String(coinWidthLogMs[(coinWidthLogNext + i) % COIN_WIDTH_LOG]);
+    response += "],\"credit_unit\":\"coin_pulse\"}";
     sendResponse(request, 200, "application/json; charset=utf-8", response);
 }
 
@@ -1477,13 +1516,10 @@ void setup() {
 #if SUNSYNC_COIN_SIGNAL_ENABLED
 #if SUNSYNC_COIN_SIGNAL_ACTIVE_HIGH
     pinMode(SUNSYNC_COIN_SIGNAL_PIN, INPUT_PULLDOWN);
-    attachInterrupt(digitalPinToInterrupt(SUNSYNC_COIN_SIGNAL_PIN),
-                    onCoinSignalPulse, RISING);
 #else
-    pinMode(SUNSYNC_COIN_SIGNAL_PIN, INPUT);  // TEMP-TEST: no internal pull, external circuit drives the line
-    attachInterrupt(digitalPinToInterrupt(SUNSYNC_COIN_SIGNAL_PIN),
-                    onCoinSignalPulse, FALLING);
+    pinMode(SUNSYNC_COIN_SIGNAL_PIN, INPUT);  // external circuit drives the line
 #endif
+    xTaskCreatePinnedToCore(coinSamplerTask, "coinSampler", 3072, nullptr, 2, nullptr, 1);
     coinInputEnabled = true;
 #else
     Serial0.println("Coin signal input disabled; configure a safe 3.3 V interface first.");
@@ -1507,16 +1543,6 @@ void setup() {
 }
 
 void loop() {
-    {  // TEMP-DIAG
-        static uint32_t lastRaw = 0, lastAcc = 0, lastChange = 0;
-        if (dbgRawEdges != lastRaw || dbgAcceptedPulses != lastAcc) {
-            lastRaw = dbgRawEdges; lastAcc = dbgAcceptedPulses; lastChange = millis();
-        } else if (lastChange && millis() - lastChange > 1500) {
-            Serial0.printf("COIN raw_edges=%u accepted=%u credits=%u\n",
-                           (unsigned)lastRaw, (unsigned)lastAcc, (unsigned)coinCredits);
-            lastChange = 0;
-        }
-    }
     releaseOrphanedCredits();
     updatePaymentWindow();
     updateServiceSession();
