@@ -423,6 +423,40 @@ bool lookupStationMacByIp(uint32_t ip, uint8_t mac[6]) {
     return false;
 }
 
+bool isStationConnected(const uint8_t mac[6]) {
+    wifi_sta_list_t stations = {};
+    if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK) return false;
+    for (int i = 0; i < stations.num; ++i) {
+        if (memcmp(stations.sta[i].mac, mac, 6) == 0) return true;
+    }
+    return false;
+}
+
+// The phone that started the service session is pinned to its Wi-Fi MAC. Knowing the device id
+// alone is not enough to pause or end it; the request must come from the same station, unless
+// that station has left the hotspot (a returning phone may come back with a new MAC).
+uint8_t serviceOwnerMac[6] = {};
+bool serviceOwnerMacKnown = false;
+
+bool requestComesFromServiceOwner(AsyncWebServerRequest* request) {
+    if (!serviceOwnerMacKnown) return true;
+    uint8_t mac[6];
+    if (!lookupStationMacByIp(static_cast<uint32_t>(request->client()->remoteIP()), mac)) {
+        return false;
+    }
+    if (memcmp(mac, serviceOwnerMac, 6) == 0) return true;
+    if (!isStationConnected(serviceOwnerMac)) {
+        memcpy(serviceOwnerMac, mac, 6);
+        return true;
+    }
+    return false;
+}
+
+void rejectForeignStation(AsyncWebServerRequest* request) {
+    sendResponse(request, 403, "application/json; charset=utf-8",
+                 "{\"detail\":\"This session belongs to another phone.\"}");
+}
+
 void queueForfeit(const String& owner, uint32_t credits);
 
 void clearCredits() {
@@ -462,7 +496,7 @@ void handlePaymentStatus(AsyncWebServerRequest* request) {
                              owner == serviceSessionOwner;
     const uint32_t clientIp = static_cast<uint32_t>(request->client()->remoteIP());
     // A returning device (new IP/MAC after forgetting the network) re-binds by its device id.
-    if (ownsService) {
+    if (ownsService && requestComesFromServiceOwner(request)) {
         serviceSessionClientIp = clientIp;
     }
     if (ownsCredits) {
@@ -615,6 +649,7 @@ void handleStartService(AsyncWebServerRequest* request) {
     serviceSessionIsCharging = sessionType == "charging";
     serviceSessionOwner = owner;
     serviceSessionClientIp = static_cast<uint32_t>(request->client()->remoteIP());
+    serviceOwnerMacKnown = lookupStationMacByIp(serviceSessionClientIp, serviceOwnerMac);
     usageBaselinePending = true;
     serviceSessionBackendId = (pendingBackendId > 0 && pendingBackendOwner == owner)
         ? pendingBackendId : 0;
@@ -638,6 +673,10 @@ void handlePauseService(AsyncWebServerRequest* request) {
     if (!ownsActiveService(requestedPaymentOwner(request))) {
         sendResponse(request, 409, "application/json; charset=utf-8",
                      "{\"detail\":\"No active service session belongs to this device.\"}");
+        return;
+    }
+    if (!requestComesFromServiceOwner(request)) {
+        rejectForeignStation(request);
         return;
     }
     if (serviceSessionPaused) {
@@ -668,6 +707,10 @@ void handleResumeService(AsyncWebServerRequest* request) {
                      "{\"detail\":\"No paused service session belongs to this device.\"}");
         return;
     }
+    if (!requestComesFromServiceOwner(request)) {
+        rejectForeignStation(request);
+        return;
+    }
     serviceSessionPaused = false;
     serviceSessionEndsAt = millis() + serviceSessionRemainingMs;
     setChargingRelay(serviceSessionIsCharging);
@@ -680,6 +723,10 @@ void handleEndService(AsyncWebServerRequest* request) {
     if (!ownsActiveService(requestedPaymentOwner(request))) {
         sendResponse(request, 409, "application/json; charset=utf-8",
                      "{\"detail\":\"No active service session belongs to this device.\"}");
+        return;
+    }
+    if (!requestComesFromServiceOwner(request)) {
+        rejectForeignStation(request);
         return;
     }
     serviceSessionActive = false;
@@ -1270,6 +1317,11 @@ void handleBackendSession(AsyncWebServerRequest* request) {
          actionParameter->value() != "end")) {
         sendResponse(request, 400, "application/json; charset=utf-8",
                      "{\"detail\":\"A numeric id and a valid action are required.\"}");
+        return;
+    }
+    if (serviceSessionActive && owner == serviceSessionOwner &&
+        !requestComesFromServiceOwner(request)) {
+        rejectForeignStation(request);
         return;
     }
     forwardToBackend(request, "PATCH",
