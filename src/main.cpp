@@ -113,10 +113,23 @@ volatile int32_t serviceSessionBackendId = 0;  // backend row for the running se
 // start for the same device succeeds, so a rejected start cannot hijack the running session.
 volatile int32_t pendingBackendId = 0;
 String pendingBackendOwner;
+// The backend computes duration from its own rate table, so the local start must reuse these
+// values instead of trusting whatever duration/credits the phone sends it directly.
+volatile uint32_t pendingBackendCredits = 0;
+volatile uint32_t pendingBackendDurationSeconds = 0;
+volatile uint32_t pendingBackendSetAtMs = 0;
+String pendingBackendSessionType;
+const uint32_t PENDING_BACKEND_TTL_MS = 120000;  // must be consumed within 2 minutes
 volatile bool usageBaselinePending = false;
 volatile uint32_t walledGardenIp = 0;  // backend address every client may reach (admin pages)
 String walledGardenHost;
 volatile uint32_t gateAllowedIp = 0;  // client IP allowed to resolve real DNS
+uint8_t gateAllowedMac[6] = {};
+volatile bool gateAllowedMacKnown = false;
+// A paused service session holds its slot and relay with no clock running; cap how long it can
+// stay paused so a forgotten or abused pause cannot block the kiosk from other customers.
+const uint32_t MAX_PAUSE_MS = 900000;  // 15 minutes
+volatile uint32_t serviceSessionPausedAtMs = 0;
 
 void setRelay(uint8_t pin, uint8_t onLevel, bool active) {
     const uint32_t level = active ? onLevel : !onLevel;
@@ -169,6 +182,7 @@ void endLocalServiceSession() {
     serviceSessionRemainingMs = 0;
     serviceSessionCredits = 0;
     serviceSessionOwner = "";
+    serviceSessionPausedAtMs = 0;
     setChargingRelay(false);
 }
 
@@ -182,6 +196,19 @@ void updateServiceSession() {
         serviceSessionOwner = "";
         setChargingRelay(false);
         Serial0.println("Service session expired; charger relay turned OFF.");
+        return;
+    }
+    if (serviceSessionActive && serviceSessionPaused && serviceSessionPausedAtMs != 0 &&
+        millis() - serviceSessionPausedAtMs >= MAX_PAUSE_MS) {
+        serviceSessionActive = false;
+        serviceSessionPaused = false;
+        serviceSessionIsCharging = false;
+        serviceSessionRemainingMs = 0;
+        serviceSessionCredits = 0;
+        serviceSessionOwner = "";
+        serviceSessionPausedAtMs = 0;
+        setChargingRelay(false);
+        Serial0.println("Service session stayed paused too long; ending it.");
     }
 }
 
@@ -608,22 +635,9 @@ void handleStartService(AsyncWebServerRequest* request) {
     updateServiceSession();
 
     const String owner = requestedPaymentOwner(request);
-    const AsyncWebParameter* typeParameter = request->getParam("session_type");
-    uint32_t creditsToSpend = 0;
-    uint32_t durationSeconds = 0;
-    if (owner.length() == 0 || owner.length() > 100 ||
-        !typeParameter || !readUnsignedParameter(request, "credits", creditsToSpend) ||
-        !readUnsignedParameter(request, "duration_seconds", durationSeconds) ||
-        durationSeconds > 86400) {
+    if (owner.length() == 0 || owner.length() > 100) {
         sendResponse(request, 400, "application/json; charset=utf-8",
-                     "{\"detail\":\"Valid device, session type, credits, and duration are required.\"}");
-        return;
-    }
-
-    const String sessionType = typeParameter->value();
-    if (sessionType != "wifi" && sessionType != "charging") {
-        sendResponse(request, 400, "application/json; charset=utf-8",
-                     "{\"detail\":\"session_type must be wifi or charging.\"}");
+                     "{\"detail\":\"A valid device is required.\"}");
         return;
     }
     if (serviceSessionActive) {
@@ -636,7 +650,26 @@ void handleStartService(AsyncWebServerRequest* request) {
                      "{\"detail\":\"These credits do not belong to this device.\"}");
         return;
     }
-    if (creditsToSpend > coinCredits) {
+    // The duration and credit cost must come from the backend's own /sessions/start reply
+    // (pinned by /api/backend/start just before this call), never from the phone's request:
+    // the phone could otherwise claim an arbitrary duration for a single coin and skip the
+    // backend entirely, leaving the sale unrecorded.
+    if (pendingBackendId <= 0 || pendingBackendOwner != owner ||
+        pendingBackendDurationSeconds == 0 || pendingBackendSetAtMs == 0 ||
+        millis() - pendingBackendSetAtMs > PENDING_BACKEND_TTL_MS) {
+        sendResponse(request, 409, "application/json; charset=utf-8",
+                     "{\"detail\":\"Start a backend session before starting service.\"}");
+        return;
+    }
+    const String sessionType = pendingBackendSessionType;
+    if (sessionType != "wifi" && sessionType != "charging") {
+        sendResponse(request, 409, "application/json; charset=utf-8",
+                     "{\"detail\":\"Start a backend session before starting service.\"}");
+        return;
+    }
+    const uint32_t creditsToSpend = pendingBackendCredits;
+    const uint32_t durationSeconds = pendingBackendDurationSeconds;
+    if (creditsToSpend == 0 || creditsToSpend > coinCredits) {
         sendResponse(request, 402, "application/json; charset=utf-8",
                      "{\"detail\":\"There are not enough credits to start this session.\"}");
         return;
@@ -652,9 +685,13 @@ void handleStartService(AsyncWebServerRequest* request) {
     serviceSessionClientIp = static_cast<uint32_t>(request->client()->remoteIP());
     serviceOwnerMacKnown = lookupStationMacByIp(serviceSessionClientIp, serviceOwnerMac);
     usageBaselinePending = true;
-    serviceSessionBackendId = (pendingBackendId > 0 && pendingBackendOwner == owner)
-        ? pendingBackendId : 0;
+    serviceSessionBackendId = pendingBackendId;
     pendingBackendId = 0;
+    pendingBackendOwner = "";
+    pendingBackendCredits = 0;
+    pendingBackendDurationSeconds = 0;
+    pendingBackendSetAtMs = 0;
+    pendingBackendSessionType = "";
     serviceSessionCredits = creditsToSpend;
     serviceSessionRemainingMs = durationSeconds * 1000UL;
     serviceSessionEndsAt = millis() + serviceSessionRemainingMs;
@@ -696,6 +733,7 @@ void handlePauseService(AsyncWebServerRequest* request) {
     }
     serviceSessionRemainingMs = static_cast<uint32_t>(remaining);
     serviceSessionPaused = true;
+    serviceSessionPausedAtMs = millis() | 1;  // non-zero sentinel
     setChargingRelay(false);
     sendResponse(request, 200, "application/json; charset=utf-8",
                  "{\"paused\":true}");
@@ -713,6 +751,7 @@ void handleResumeService(AsyncWebServerRequest* request) {
         return;
     }
     serviceSessionPaused = false;
+    serviceSessionPausedAtMs = 0;
     serviceSessionEndsAt = millis() + serviceSessionRemainingMs;
     setChargingRelay(serviceSessionIsCharging);
     sendResponse(request, 200, "application/json; charset=utf-8",
@@ -736,6 +775,7 @@ void handleEndService(AsyncWebServerRequest* request) {
     serviceSessionRemainingMs = 0;
     serviceSessionCredits = 0;
     serviceSessionOwner = "";
+    serviceSessionPausedAtMs = 0;
     setChargingRelay(false);
     sendResponse(request, 200, "application/json; charset=utf-8",
                  "{\"ended\":true}");
@@ -887,21 +927,39 @@ bool getClientTraffic(const uint8_t* mac, uint64_t& down, uint64_t& up) {
     return found;
 }
 
+// Unpaid clients may only reach the backend's own IP, and only over HTTPS (443). Without the
+// port check, anyone could point an arbitrary TCP service at that same IP (easy on a platform
+// like Fly.io, where many apps share one anycast address) and tunnel general internet through
+// the walled garden.
+bool isWalledGardenPort(const uint8_t* frame, uint16_t frameLen) {
+    if (frameLen < 34) return false;
+    const uint8_t ihl = (frame[14] & 0x0F) * 4;
+    if (ihl < 20 || frame[23] != 6 /* TCP */ || frameLen < 14 + ihl + 4) return false;
+    const uint16_t dstPort = (static_cast<uint16_t>(frame[14 + ihl + 2]) << 8) |
+                             frame[14 + ihl + 3];
+    return dstPort == 443;
+}
+
 err_t countingApInput(struct pbuf* p, struct netif* inp) {
     if (p && p->len >= 34) {
         const uint8_t* frame = static_cast<const uint8_t*>(p->payload);
         const bool ipv4 = frame[12] == 0x08 && frame[13] == 0x00;
         if (ipv4 && (frame[0] & 1) == 0 && memcmp(frame + 30, trafficApIp, 4) != 0) {
             // Traffic leaving the AP is only forwarded for the client with an active, unpaused
-            // Wi-Fi session. Broadcast and multicast (DHCP, ARP-adjacent) are left alone.
+            // Wi-Fi session, and only from the Wi-Fi MAC that session is bound to (an IP alone
+            // can be spoofed by another station on the same open hotspot). Broadcast and
+            // multicast (DHCP, ARP-adjacent) are left alone.
             uint32_t srcIp;
             memcpy(&srcIp, frame + 26, 4);
             const bool broadcastOrMulticast = frame[30] >= 224 || frame[33] == 255;
             uint32_t dstIp;
             memcpy(&dstIp, frame + 30, 4);
-            const bool toWalledGarden = walledGardenIp != 0 && dstIp == walledGardenIp;
-            if (!broadcastOrMulticast && !toWalledGarden &&
-                (gateAllowedIp == 0 || srcIp != gateAllowedIp)) {
+            const bool toWalledGarden = walledGardenIp != 0 && dstIp == walledGardenIp &&
+                                        isWalledGardenPort(frame, p->len);
+            const bool fromPaidClient = gateAllowedIp != 0 && srcIp == gateAllowedIp &&
+                                        gateAllowedMacKnown &&
+                                        memcmp(frame + 6, gateAllowedMac, 6) == 0;
+            if (!broadcastOrMulticast && !toWalledGarden && !fromPaidClient) {
                 pbuf_free(p);
                 return ERR_OK;
             }
@@ -1102,8 +1160,18 @@ void backendWorker(void*) {
                                     const int from = devAt + 13;
                                     newOwner = received.substring(from, received.indexOf('"', from));
                                 }
-                                pendingBackendOwner = newOwner;
-                                pendingBackendId = newId;
+                                uint32_t newDuration = 0;
+                                const int durAt = received.indexOf("\"duration_seconds\":");
+                                if (durAt >= 0) {
+                                    newDuration = static_cast<uint32_t>(
+                                        received.substring(durAt + 20).toInt());
+                                }
+                                if (newId > 0 && newOwner.length() > 0 && newDuration > 0) {
+                                    pendingBackendOwner = newOwner;
+                                    pendingBackendDurationSeconds = newDuration;
+                                    pendingBackendSetAtMs = millis() | 1;
+                                    pendingBackendId = newId;
+                                }
                             }
                         }
                         if (code >= 200 && code < 300 && job->path == "/devices/telemetry") {
@@ -1303,6 +1371,12 @@ void handleBackendStart(AsyncWebServerRequest* request) {
     }
     String body = "{\"device_id\":\"" + owner + "\",\"session_type\":\"" +
                   typeParameter->value() + "\",\"credits\":" + String(credits) + "}";
+    // Pin the credits and type that were actually charged to the backend; /api/service/start
+    // must use these (and the backend's own duration), not whatever the phone claims later.
+    pendingBackendId = 0;
+    pendingBackendOwner = "";
+    pendingBackendCredits = credits;
+    pendingBackendSessionType = typeParameter->value();
     forwardToBackend(request, "POST", "/sessions/start", body);
 }
 
@@ -1551,8 +1625,12 @@ void gateDnsTask(void*) {
         const uint32_t allowedIp = gateAllowedIp;
         const IPAddress upstreamDns = WiFi.dnsIP();
         size_t replySize = 0;
-        if (allowedIp != 0 && static_cast<uint32_t>(clientIp) == allowedIp &&
-            upstreamDns != IPAddress(0, 0, 0, 0)) {
+        uint8_t clientMac[6];
+        const bool clientIsPaidOwner = allowedIp != 0 &&
+            static_cast<uint32_t>(clientIp) == allowedIp && gateAllowedMacKnown &&
+            lookupStationMacByIp(static_cast<uint32_t>(clientIp), clientMac) &&
+            memcmp(clientMac, gateAllowedMac, 6) == 0;
+        if (clientIsPaidOwner && upstreamDns != IPAddress(0, 0, 0, 0)) {
             upstreamSocket.beginPacket(upstreamDns, 53);
             upstreamSocket.write(query, length);
             upstreamSocket.endPacket();
@@ -1760,6 +1838,12 @@ void loop() {
     reportTelemetry();
     gateAllowedIp = (serviceSessionActive && !serviceSessionPaused && !serviceSessionIsCharging)
         ? serviceSessionClientIp : 0;
+    if (gateAllowedIp != 0 && serviceOwnerMacKnown) {
+        memcpy(gateAllowedMac, serviceOwnerMac, 6);
+        gateAllowedMacKnown = true;
+    } else {
+        gateAllowedMacKnown = false;
+    }
     updateLcd();
     serviceMqtt();
 
