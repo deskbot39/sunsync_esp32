@@ -82,13 +82,11 @@ header {
     color: var(--side-textb);
 }
 
-header::before {
+header .brand-logo {
     display: block;
-    width: 3.25rem;
-    height: 0.3rem;
-    margin-bottom: 1.2rem;
-    background: var(--side-activeb);
-    content: '';
+    width: 4rem;
+    height: 4rem;
+    margin-bottom: 1rem;
 }
 
 header h1 {
