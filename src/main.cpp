@@ -1151,20 +1151,24 @@ void backendWorker(void*) {
                         status = code;
                         if (code >= 200 && code < 300 && job->method == "POST" &&
                             job->path == "/sessions/start") {
-                            const int idAt = received.indexOf("\"id\":");
+                            static const char idKey[] = "\"id\":";
+                            static const char devKey[] = "\"device_id\":\"";
+                            static const char durKey[] = "\"duration_seconds\":";
+                            const int idAt = received.indexOf(idKey);
                             if (idAt >= 0) {
-                                const int32_t newId = received.substring(idAt + 5).toInt();
+                                const int32_t newId =
+                                    received.substring(idAt + strlen(idKey)).toInt();
                                 String newOwner;
-                                const int devAt = received.indexOf("\"device_id\":\"");
+                                const int devAt = received.indexOf(devKey);
                                 if (devAt >= 0) {
-                                    const int from = devAt + 13;
+                                    const int from = devAt + strlen(devKey);
                                     newOwner = received.substring(from, received.indexOf('"', from));
                                 }
                                 uint32_t newDuration = 0;
-                                const int durAt = received.indexOf("\"duration_seconds\":");
+                                const int durAt = received.indexOf(durKey);
                                 if (durAt >= 0) {
                                     newDuration = static_cast<uint32_t>(
-                                        received.substring(durAt + 20).toInt());
+                                        received.substring(durAt + strlen(durKey)).toInt());
                                 }
                                 if (newId > 0 && newOwner.length() > 0 && newDuration > 0) {
                                     pendingBackendOwner = newOwner;
