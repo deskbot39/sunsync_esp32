@@ -135,6 +135,9 @@ volatile uint32_t pendingBackendDurationSeconds = 0;
 volatile uint32_t pendingBackendSetAtMs = 0;
 String pendingBackendSessionType;
 const uint32_t PENDING_BACKEND_TTL_MS = 120000;  // must be consumed within 2 minutes
+// Set while a /sessions/start request is queued or in flight; cleared when it completes.
+volatile uint32_t backendStartInFlightSinceMs = 0;
+const uint32_t BACKEND_START_IN_FLIGHT_MS = 45000;
 volatile uint32_t walledGardenIp = 0;  // backend address every client may reach (admin pages)
 String walledGardenHost;
 // Phones with an active, unpaused Wi-Fi session: only these may use the internet and real DNS.
@@ -557,6 +560,15 @@ void rejectForeignStation(AsyncWebServerRequest* request) {
                  "{\"detail\":\"This session belongs to another phone.\"}");
 }
 
+// The hotspot is open, so a device id can be sniffed. Spending credits also requires the
+// request to come from the Wi-Fi station that opened the payment window.
+bool requestComesFromPayer(AsyncWebServerRequest* request) {
+    if (!payOwnerMacKnown) return true;
+    uint8_t mac[6];
+    return lookupStationMacByIp(static_cast<uint32_t>(request->client()->remoteIP()), mac) &&
+           memcmp(mac, payOwnerMac, 6) == 0;
+}
+
 void queueForfeit(const String& owner, uint32_t credits);
 
 void clearCredits() {
@@ -714,7 +726,7 @@ void handleStartService(AsyncWebServerRequest* request) {
                      "{\"detail\":\"This device already has an active session.\"}");
         return;
     }
-    if (!ownsPaymentCredits(owner)) {
+    if (!ownsPaymentCredits(owner) || !requestComesFromPayer(request)) {
         sendResponse(request, 403, "application/json; charset=utf-8",
                      "{\"detail\":\"These credits do not belong to this device.\"}");
         return;
@@ -1044,7 +1056,10 @@ err_t countingApInput(struct pbuf* p, struct netif* inp) {
             // multicast (DHCP, ARP-adjacent) are left alone.
             uint32_t srcIp;
             memcpy(&srcIp, frame + 26, 4);
-            const bool broadcastOrMulticast = frame[30] >= 224 || frame[33] == 255;
+            const bool broadcastOrMulticast =
+                frame[30] >= 224 ||
+                (frame[30] == 255 && frame[31] == 255 && frame[32] == 255 && frame[33] == 255) ||
+                (memcmp(frame + 30, trafficApIp, 3) == 0 && frame[33] == 255);
             uint32_t dstIp;
             memcpy(&dstIp, frame + 30, 4);
             const bool toWalledGarden = walledGardenIp != 0 && dstIp == walledGardenIp &&
@@ -1276,10 +1291,28 @@ void backendWorker(void*) {
                                         received.substring(durAt + strlen(durKey)).toInt());
                                 }
                                 if (newId > 0 && newOwner.length() > 0 && newDuration > 0) {
-                                    pendingBackendOwner = newOwner;
-                                    pendingBackendDurationSeconds = newDuration;
-                                    pendingBackendSetAtMs = millis() | 1;
-                                    pendingBackendId = newId;
+                                    // Credits and type come from this job's own request body,
+                                    // so the reply can never be paired with another start.
+                                    static const char credKey[] = "\"credits\":";
+                                    static const char typeKey[] = "\"session_type\":\"";
+                                    const int credAt = job->body.indexOf(credKey);
+                                    const int typeAt = job->body.indexOf(typeKey);
+                                    String jobType;
+                                    if (typeAt >= 0) {
+                                        const int from = typeAt + strlen(typeKey);
+                                        jobType = job->body.substring(from, job->body.indexOf('"', from));
+                                    }
+                                    const long jobCredits = credAt >= 0
+                                        ? job->body.substring(credAt + strlen(credKey)).toInt()
+                                        : 0;
+                                    if (jobCredits > 0) {
+                                        pendingBackendOwner = newOwner;
+                                        pendingBackendCredits = static_cast<uint32_t>(jobCredits);
+                                        pendingBackendSessionType = jobType;
+                                        pendingBackendDurationSeconds = newDuration;
+                                        pendingBackendSetAtMs = millis() | 1;
+                                        pendingBackendId = newId;
+                                    }
                                 }
                             }
                         }
@@ -1296,6 +1329,7 @@ void backendWorker(void*) {
                 http.end();
             }
         }
+        if (job->path == "/sessions/start") backendStartInFlightSinceMs = 0;
         if (auto request = job->request.lock()) {
             sendResponse(request.get(), status, responseType.c_str(), payload);
         }
@@ -1324,18 +1358,22 @@ void startBackendWorker() {
 
 void forwardToBackend(AsyncWebServerRequest* request, const char* method,
                       const String& path, const String& body = String()) {
+    const bool isStart = path == "/sessions/start";
     if (!backendConfigured() || !backendQueue) {
+        if (isStart) backendStartInFlightSinceMs = 0;
         sendResponse(request, 503, "application/json; charset=utf-8",
                      "{\"detail\":\"Backend is not configured on this device.\"}");
         return;
     }
     if (uxQueueSpacesAvailable(backendQueue) == 0) {
+        if (isStart) backendStartInFlightSinceMs = 0;
         sendResponse(request, 503, "application/json; charset=utf-8",
                      "{\"detail\":\"The device is busy. Try again shortly.\"}");
         return;
     }
     BackendJob* job = new BackendJob{request->pause(), method, path, body};
     if (xQueueSend(backendQueue, &job, 0) != pdTRUE) {
+        if (isStart) backendStartInFlightSinceMs = 0;
         if (auto paused = job->request.lock()) {
             sendResponse(paused.get(), 503, "application/json; charset=utf-8",
                          "{\"detail\":\"The device is busy. Try again shortly.\"}");
@@ -1458,9 +1496,17 @@ void handleBackendStart(AsyncWebServerRequest* request) {
                      "{\"detail\":\"Valid session_type and credits are required.\"}");
         return;
     }
-    if (!ownsPaymentCredits(owner)) {
+    if (!ownsPaymentCredits(owner) || !requestComesFromPayer(request)) {
         sendResponse(request, 403, "application/json; charset=utf-8",
                      "{\"detail\":\"These credits do not belong to this device.\"}");
+        return;
+    }
+    // One start at a time: overlapping starts could pair one reply's duration with another
+    // request's (smaller) credit cost.
+    if (backendStartInFlightSinceMs != 0 &&
+        millis() - backendStartInFlightSinceMs < BACKEND_START_IN_FLIGHT_MS) {
+        sendResponse(request, 409, "application/json; charset=utf-8",
+                     "{\"detail\":\"A session start is already in progress.\"}");
         return;
     }
     // Pressing Connect/Charge ends coin collection; count pulses already queued first.
@@ -1475,10 +1521,12 @@ void handleBackendStart(AsyncWebServerRequest* request) {
                   typeParameter->value() + "\",\"credits\":" + String(credits) + "}";
     // Pin the credits and type that were actually charged to the backend; /api/service/start
     // must use these (and the backend's own duration), not whatever the phone claims later.
+    // The backend worker re-reads them from this job's body when the reply arrives.
     pendingBackendId = 0;
     pendingBackendOwner = "";
-    pendingBackendCredits = credits;
-    pendingBackendSessionType = typeParameter->value();
+    pendingBackendCredits = 0;
+    pendingBackendSessionType = "";
+    backendStartInFlightSinceMs = millis() | 1;
     forwardToBackend(request, "POST", "/sessions/start", body);
 }
 
