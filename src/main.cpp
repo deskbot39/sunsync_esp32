@@ -100,15 +100,30 @@ uint32_t lastCreditAtMs = 0;
 uint32_t coinPulseRemainder = 0;
 uint32_t payWindowEndsAt = 0;
 String payWindowOwner;
-bool serviceSessionActive = false;
-bool serviceSessionPaused = false;
-bool serviceSessionIsCharging = false;
-uint32_t serviceSessionEndsAt = 0;
-uint32_t serviceSessionRemainingMs = 0;
-uint32_t serviceSessionCredits = 0;
-String serviceSessionOwner;
-uint32_t serviceSessionClientIp = 0;
-volatile int32_t serviceSessionBackendId = 0;  // backend row for the running session
+// Must match the backend's MAX_WIFI_USERS (5) and MAX_CHARGING_USERS (1).
+constexpr uint8_t MAX_WIFI_SESSIONS = 5;
+constexpr uint8_t MAX_SERVICE_SLOTS = MAX_WIFI_SESSIONS + 1;  // plus the single charger relay
+struct ServiceSlot {
+    bool active = false;
+    bool paused = false;
+    bool isCharging = false;
+    uint32_t endsAt = 0;
+    uint32_t remainingMs = 0;
+    uint32_t pausedAtMs = 0;  // non-zero while paused
+    String owner;
+    uint32_t clientIp = 0;
+    // The phone that started the session is pinned to its Wi-Fi MAC (see requestComesFromSlotOwner).
+    uint8_t ownerMac[6] = {};
+    bool ownerMacKnown = false;
+    int32_t backendId = 0;  // backend row for this session
+    // Download accounting for the usage report; carry keeps bytes from a MAC the phone dropped.
+    uint8_t usageMac[6] = {};
+    bool usageMacKnown = false;
+    uint64_t usageBaseline = 0;
+    uint64_t usageCarry = 0;
+    uint32_t lastUsageReportMs = 0;
+};
+ServiceSlot serviceSlots[MAX_SERVICE_SLOTS];
 // A backend session row is created before the local start; it is only adopted once the local
 // start for the same device succeeds, so a rejected start cannot hijack the running session.
 volatile int32_t pendingBackendId = 0;
@@ -120,16 +135,82 @@ volatile uint32_t pendingBackendDurationSeconds = 0;
 volatile uint32_t pendingBackendSetAtMs = 0;
 String pendingBackendSessionType;
 const uint32_t PENDING_BACKEND_TTL_MS = 120000;  // must be consumed within 2 minutes
-volatile bool usageBaselinePending = false;
 volatile uint32_t walledGardenIp = 0;  // backend address every client may reach (admin pages)
 String walledGardenHost;
-volatile uint32_t gateAllowedIp = 0;  // client IP allowed to resolve real DNS
-uint8_t gateAllowedMac[6] = {};
-volatile bool gateAllowedMacKnown = false;
+// Phones with an active, unpaused Wi-Fi session: only these may use the internet and real DNS.
+// Rebuilt by the main loop; read by the packet hook and the DNS task.
+struct GateEntry {
+    uint32_t ip;
+    uint8_t mac[6];
+};
+GateEntry gateEntries[MAX_WIFI_SESSIONS];
+uint8_t gateEntryCount = 0;
+portMUX_TYPE gateMux = portMUX_INITIALIZER_UNLOCKED;
 // A paused service session holds its slot and relay with no clock running; cap how long it can
 // stay paused so a forgotten or abused pause cannot block the kiosk from other customers.
 const uint32_t MAX_PAUSE_MS = 900000;  // 15 minutes
-volatile uint32_t serviceSessionPausedAtMs = 0;
+
+bool isPaidClient(uint32_t ip, const uint8_t* mac) {
+    bool allowed = false;
+    portENTER_CRITICAL(&gateMux);
+    for (uint8_t i = 0; i < gateEntryCount; ++i) {
+        if (gateEntries[i].ip == ip && memcmp(gateEntries[i].mac, mac, 6) == 0) {
+            allowed = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&gateMux);
+    return allowed;
+}
+
+void refreshGateEntries() {
+    GateEntry entries[MAX_WIFI_SESSIONS];
+    uint8_t count = 0;
+    for (const ServiceSlot& slot : serviceSlots) {
+        if (slot.active && !slot.paused && !slot.isCharging && slot.ownerMacKnown &&
+            slot.clientIp != 0 && count < MAX_WIFI_SESSIONS) {
+            entries[count].ip = slot.clientIp;
+            memcpy(entries[count].mac, slot.ownerMac, 6);
+            ++count;
+        }
+    }
+    portENTER_CRITICAL(&gateMux);
+    memcpy(gateEntries, entries, sizeof(GateEntry) * count);
+    gateEntryCount = count;
+    portEXIT_CRITICAL(&gateMux);
+}
+
+ServiceSlot* findServiceSlot(const String& owner) {
+    if (owner.length() == 0) return nullptr;
+    for (ServiceSlot& slot : serviceSlots) {
+        if (slot.active && slot.owner == owner) return &slot;
+    }
+    return nullptr;
+}
+
+ServiceSlot* findChargingSlot() {
+    for (ServiceSlot& slot : serviceSlots) {
+        if (slot.active && slot.isCharging) return &slot;
+    }
+    return nullptr;
+}
+
+uint8_t activeWifiSessionCount() {
+    uint8_t count = 0;
+    for (const ServiceSlot& slot : serviceSlots) {
+        if (slot.active && !slot.isCharging) ++count;
+    }
+    return count;
+}
+
+bool anyServiceActive() {
+    for (const ServiceSlot& slot : serviceSlots) {
+        if (slot.active) return true;
+    }
+    return false;
+}
+
+void reportSlotUsage(ServiceSlot& slot);
 
 void setRelay(uint8_t pin, uint8_t onLevel, bool active) {
     const uint32_t level = active ? onLevel : !onLevel;
@@ -175,40 +256,34 @@ void updateRouterCut() {
     }
 }
 
-void endLocalServiceSession() {
-    serviceSessionActive = false;
-    serviceSessionPaused = false;
-    serviceSessionIsCharging = false;
-    serviceSessionRemainingMs = 0;
-    serviceSessionCredits = 0;
-    serviceSessionOwner = "";
-    serviceSessionPausedAtMs = 0;
-    setChargingRelay(false);
+void endServiceSlot(ServiceSlot& slot, const char* reason) {
+    if (!slot.active) return;
+    const bool wasCharging = slot.isCharging;
+    // One last usage report so the dashboard has the session's final download total.
+    if (!wasCharging && slot.backendId > 0) reportSlotUsage(slot);
+    slot.active = false;
+    slot.paused = false;
+    slot.isCharging = false;
+    slot.remainingMs = 0;
+    slot.pausedAtMs = 0;
+    slot.owner = "";
+    slot.clientIp = 0;
+    slot.ownerMacKnown = false;
+    slot.backendId = 0;
+    slot.usageMacKnown = false;
+    if (wasCharging) setChargingRelay(false);
+    Serial0.printf("%s session ended: %s\n", wasCharging ? "Charging" : "Wi-Fi", reason);
 }
 
 void updateServiceSession() {
-    if (serviceSessionActive && !serviceSessionPaused &&
-        static_cast<int32_t>(millis() - serviceSessionEndsAt) >= 0) {
-        serviceSessionActive = false;
-        serviceSessionIsCharging = false;
-        serviceSessionRemainingMs = 0;
-        serviceSessionCredits = 0;
-        serviceSessionOwner = "";
-        setChargingRelay(false);
-        Serial0.println("Service session expired; charger relay turned OFF.");
-        return;
-    }
-    if (serviceSessionActive && serviceSessionPaused && serviceSessionPausedAtMs != 0 &&
-        millis() - serviceSessionPausedAtMs >= MAX_PAUSE_MS) {
-        serviceSessionActive = false;
-        serviceSessionPaused = false;
-        serviceSessionIsCharging = false;
-        serviceSessionRemainingMs = 0;
-        serviceSessionCredits = 0;
-        serviceSessionOwner = "";
-        serviceSessionPausedAtMs = 0;
-        setChargingRelay(false);
-        Serial0.println("Service session stayed paused too long; ending it.");
+    for (ServiceSlot& slot : serviceSlots) {
+        if (!slot.active) continue;
+        if (!slot.paused && static_cast<int32_t>(millis() - slot.endsAt) >= 0) {
+            endServiceSlot(slot, "time used up");
+        } else if (slot.paused && slot.pausedAtMs != 0 &&
+                   millis() - slot.pausedAtMs >= MAX_PAUSE_MS) {
+            endServiceSlot(slot, "paused too long");
+        }
     }
 }
 
@@ -257,10 +332,10 @@ String formatLcdClock(uint32_t totalSeconds) {
     return String(line);
 }
 
-uint32_t serviceSessionRemainingSeconds() {
-    uint32_t remainingMs = serviceSessionRemainingMs;
-    if (!serviceSessionPaused) {
-        const int32_t left = static_cast<int32_t>(serviceSessionEndsAt - millis());
+uint32_t serviceSessionRemainingSeconds(const ServiceSlot& slot) {
+    uint32_t remainingMs = slot.remainingMs;
+    if (!slot.paused) {
+        const int32_t left = static_cast<int32_t>(slot.endsAt - millis());
         remainingMs = left > 0 ? static_cast<uint32_t>(left) : 0;
     }
     return (remainingMs + 999) / 1000;
@@ -284,9 +359,9 @@ void updateLcd() {
             lines[0] = "CREDITS PENDING";
         }
         lines[1] = "CREDITS: " + String(coinCredits);
-    } else if (serviceSessionActive && serviceSessionIsCharging) {
+    } else if (const ServiceSlot* charging = findChargingSlot()) {
         lines[0] = "CHARGING TIME:";
-        lines[1] = formatLcdClock(serviceSessionRemainingSeconds());
+        lines[1] = formatLcdClock(serviceSessionRemainingSeconds(*charging));
     } else {
         lines[0] = "PRESS PAY BUTTON";
         lines[1] = "ON YOUR PHONE";
@@ -460,21 +535,18 @@ bool isStationConnected(const uint8_t mac[6]) {
     return false;
 }
 
-// The phone that started the service session is pinned to its Wi-Fi MAC. Knowing the device id
+// The phone that started a service session is pinned to its Wi-Fi MAC. Knowing the device id
 // alone is not enough to pause or end it; the request must come from the same station, unless
 // that station has left the hotspot (a returning phone may come back with a new MAC).
-uint8_t serviceOwnerMac[6] = {};
-bool serviceOwnerMacKnown = false;
-
-bool requestComesFromServiceOwner(AsyncWebServerRequest* request) {
-    if (!serviceOwnerMacKnown) return true;
+bool requestComesFromSlotOwner(ServiceSlot& slot, AsyncWebServerRequest* request) {
+    if (!slot.ownerMacKnown) return true;
     uint8_t mac[6];
     if (!lookupStationMacByIp(static_cast<uint32_t>(request->client()->remoteIP()), mac)) {
         return false;
     }
-    if (memcmp(mac, serviceOwnerMac, 6) == 0) return true;
-    if (!isStationConnected(serviceOwnerMac)) {
-        memcpy(serviceOwnerMac, mac, 6);
+    if (memcmp(mac, slot.ownerMac, 6) == 0) return true;
+    if (!isStationConnected(slot.ownerMac)) {
+        memcpy(slot.ownerMac, mac, 6);
         return true;
     }
     return false;
@@ -503,7 +575,7 @@ void clearCredits() {
 // Unspent credits are forfeited (and recorded as a sale) when the owner leaves or stops using
 // them for CREDIT_IDLE_EXPIRY_MS.
 void releaseOrphanedCredits() {
-    if (coinCredits > 0 && !coinPayWindowOpen && !serviceSessionActive &&
+    if (coinCredits > 0 && !coinPayWindowOpen && !findServiceSlot(payWindowOwner) &&
         millis() - lastCreditAtMs >= CREDIT_IDLE_EXPIRY_MS) {
         creditClearAtMs = 0;
         clearCredits();
@@ -520,12 +592,12 @@ void handlePaymentStatus(AsyncWebServerRequest* request) {
     updatePaymentWindow();
     const String owner = requestedPaymentOwner(request);
     const bool ownsCredits = ownsPaymentCredits(owner);
-    const bool ownsService = serviceSessionActive && owner.length() > 0 &&
-                             owner == serviceSessionOwner;
+    ServiceSlot* slot = findServiceSlot(owner);
+    const bool ownsService = slot != nullptr;
     const uint32_t clientIp = static_cast<uint32_t>(request->client()->remoteIP());
     // A returning device (new IP/MAC after forgetting the network) re-binds by its device id.
-    if (ownsService && requestComesFromServiceOwner(request)) {
-        serviceSessionClientIp = clientIp;
+    if (ownsService && requestComesFromSlotOwner(*slot, request)) {
+        slot->clientIp = clientIp;
     }
     if (ownsCredits) {
         creditClearAtMs = 0;
@@ -544,9 +616,9 @@ void handlePaymentStatus(AsyncWebServerRequest* request) {
     response += ",\"service_active\":";
     response += ownsService ? "true" : "false";
     response += ",\"service_paused\":";
-    response += ownsService && serviceSessionPaused ? "true" : "false";
+    response += ownsService && slot->paused ? "true" : "false";
     response += ",\"service_remaining_seconds\":";
-    response += ownsService ? String(serviceSessionRemainingSeconds()) : "0";
+    response += ownsService ? String(serviceSessionRemainingSeconds(*slot)) : "0";
     response += ",\"recent_coin_pulse_counts\":[";
     for (uint8_t i = 0; i < coinBurstLogCount; ++i) response += (i ? "," : "") + String(coinBurstLog[i]);
     response += "],\"recent_pulse_widths_ms\":[";
@@ -625,10 +697,7 @@ bool readUnsignedParameter(AsyncWebServerRequest* request, const char* name,
     return true;
 }
 
-bool ownsActiveService(const String& owner) {
-    return owner.length() > 0 && owner == serviceSessionOwner &&
-           serviceSessionActive;
-}
+void queueSessionConfirm(int32_t backendId, const String& owner);
 
 void handleStartService(AsyncWebServerRequest* request) {
     updatePaymentWindow();
@@ -640,9 +709,9 @@ void handleStartService(AsyncWebServerRequest* request) {
                      "{\"detail\":\"A valid device is required.\"}");
         return;
     }
-    if (serviceSessionActive) {
+    if (findServiceSlot(owner)) {
         sendResponse(request, 409, "application/json; charset=utf-8",
-                     "{\"detail\":\"A service session is already active.\"}");
+                     "{\"detail\":\"This device already has an active session.\"}");
         return;
     }
     if (!ownsPaymentCredits(owner)) {
@@ -667,6 +736,29 @@ void handleStartService(AsyncWebServerRequest* request) {
                      "{\"detail\":\"Start a backend session before starting service.\"}");
         return;
     }
+    const bool charging = sessionType == "charging";
+    if (charging && findChargingSlot()) {
+        sendResponse(request, 409, "application/json; charset=utf-8",
+                     "{\"detail\":\"The charging port is in use.\"}");
+        return;
+    }
+    if (!charging && activeWifiSessionCount() >= MAX_WIFI_SESSIONS) {
+        sendResponse(request, 409, "application/json; charset=utf-8",
+                     "{\"detail\":\"All Wi-Fi slots are in use.\"}");
+        return;
+    }
+    ServiceSlot* slot = nullptr;
+    for (ServiceSlot& candidate : serviceSlots) {
+        if (!candidate.active) {
+            slot = &candidate;
+            break;
+        }
+    }
+    if (!slot) {
+        sendResponse(request, 409, "application/json; charset=utf-8",
+                     "{\"detail\":\"All service slots are in use.\"}");
+        return;
+    }
     const uint32_t creditsToSpend = pendingBackendCredits;
     const uint32_t durationSeconds = pendingBackendDurationSeconds;
     if (creditsToSpend == 0 || creditsToSpend > coinCredits) {
@@ -678,105 +770,106 @@ void handleStartService(AsyncWebServerRequest* request) {
     coinCredits -= creditsToSpend;
     updatePaymentWindow();
     closePaymentWindow();
-    serviceSessionActive = true;
-    serviceSessionPaused = false;
-    serviceSessionIsCharging = sessionType == "charging";
-    serviceSessionOwner = owner;
-    serviceSessionClientIp = static_cast<uint32_t>(request->client()->remoteIP());
-    serviceOwnerMacKnown = lookupStationMacByIp(serviceSessionClientIp, serviceOwnerMac);
-    usageBaselinePending = true;
-    serviceSessionBackendId = pendingBackendId;
+    slot->paused = false;
+    slot->pausedAtMs = 0;
+    slot->isCharging = charging;
+    slot->owner = owner;
+    slot->clientIp = static_cast<uint32_t>(request->client()->remoteIP());
+    slot->ownerMacKnown = lookupStationMacByIp(slot->clientIp, slot->ownerMac);
+    slot->usageMacKnown = false;
+    slot->usageBaseline = 0;
+    slot->usageCarry = 0;
+    slot->lastUsageReportMs = millis();
+    slot->backendId = pendingBackendId;
+    slot->remainingMs = durationSeconds * 1000UL;
+    slot->endsAt = millis() + slot->remainingMs;
+    slot->active = true;
     pendingBackendId = 0;
     pendingBackendOwner = "";
     pendingBackendCredits = 0;
     pendingBackendDurationSeconds = 0;
     pendingBackendSetAtMs = 0;
     pendingBackendSessionType = "";
-    serviceSessionCredits = creditsToSpend;
-    serviceSessionRemainingMs = durationSeconds * 1000UL;
-    serviceSessionEndsAt = millis() + serviceSessionRemainingMs;
-    setChargingRelay(serviceSessionIsCharging);
-    if (serviceSessionIsCharging) {
+    // The backend books the sale only once the kiosk confirms the session really started.
+    queueSessionConfirm(slot->backendId, owner);
+    if (charging) {
+        setChargingRelay(true);
         Serial0.printf("Charging session started for %lu seconds; charger relay ON.\n",
                        static_cast<unsigned long>(durationSeconds));
     } else {
-        Serial0.printf("Wi-Fi session started for %lu seconds; router relay remains ON.\n",
-                       static_cast<unsigned long>(durationSeconds));
+        Serial0.printf("Wi-Fi session started for %lu seconds (%u of %u Wi-Fi slots in use).\n",
+                       static_cast<unsigned long>(durationSeconds),
+                       static_cast<unsigned>(activeWifiSessionCount()),
+                       static_cast<unsigned>(MAX_WIFI_SESSIONS));
     }
     handlePaymentStatus(request);
 }
 
-void handlePauseService(AsyncWebServerRequest* request) {
-    updateServiceSession();
-    if (!ownsActiveService(requestedPaymentOwner(request))) {
+// Finds the caller's own session and checks the request comes from the phone that owns it.
+// Sends the error response and returns nullptr otherwise.
+ServiceSlot* requireOwnSlot(AsyncWebServerRequest* request) {
+    ServiceSlot* slot = findServiceSlot(requestedPaymentOwner(request));
+    if (!slot) {
         sendResponse(request, 409, "application/json; charset=utf-8",
                      "{\"detail\":\"No active service session belongs to this device.\"}");
-        return;
+        return nullptr;
     }
-    if (!requestComesFromServiceOwner(request)) {
+    if (!requestComesFromSlotOwner(*slot, request)) {
         rejectForeignStation(request);
-        return;
+        return nullptr;
     }
-    if (serviceSessionPaused) {
+    return slot;
+}
+
+void handlePauseService(AsyncWebServerRequest* request) {
+    updateServiceSession();
+    ServiceSlot* slot = requireOwnSlot(request);
+    if (!slot) return;
+    if (slot->paused) {
         sendResponse(request, 409, "application/json; charset=utf-8",
                      "{\"detail\":\"Service session is already paused.\"}");
         return;
     }
 
-    const int32_t remaining =
-        static_cast<int32_t>(serviceSessionEndsAt - millis());
+    const int32_t remaining = static_cast<int32_t>(slot->endsAt - millis());
     if (remaining <= 0) {
         updateServiceSession();
         sendResponse(request, 409, "application/json; charset=utf-8",
                      "{\"detail\":\"Service session has expired.\"}");
         return;
     }
-    serviceSessionRemainingMs = static_cast<uint32_t>(remaining);
-    serviceSessionPaused = true;
-    serviceSessionPausedAtMs = millis() | 1;  // non-zero sentinel
-    setChargingRelay(false);
+    slot->remainingMs = static_cast<uint32_t>(remaining);
+    slot->paused = true;
+    slot->pausedAtMs = millis() | 1;  // non-zero sentinel
+    if (slot->isCharging) setChargingRelay(false);
     sendResponse(request, 200, "application/json; charset=utf-8",
                  "{\"paused\":true}");
 }
 
 void handleResumeService(AsyncWebServerRequest* request) {
-    if (!ownsActiveService(requestedPaymentOwner(request)) ||
-        !serviceSessionPaused) {
+    ServiceSlot* slot = findServiceSlot(requestedPaymentOwner(request));
+    if (!slot || !slot->paused) {
         sendResponse(request, 409, "application/json; charset=utf-8",
                      "{\"detail\":\"No paused service session belongs to this device.\"}");
         return;
     }
-    if (!requestComesFromServiceOwner(request)) {
+    if (!requestComesFromSlotOwner(*slot, request)) {
         rejectForeignStation(request);
         return;
     }
-    serviceSessionPaused = false;
-    serviceSessionPausedAtMs = 0;
-    serviceSessionEndsAt = millis() + serviceSessionRemainingMs;
-    setChargingRelay(serviceSessionIsCharging);
+    slot->paused = false;
+    slot->pausedAtMs = 0;
+    slot->endsAt = millis() + slot->remainingMs;
+    if (slot->isCharging) setChargingRelay(true);
     sendResponse(request, 200, "application/json; charset=utf-8",
                  "{\"paused\":false}");
 }
 
 void handleEndService(AsyncWebServerRequest* request) {
     updateServiceSession();
-    if (!ownsActiveService(requestedPaymentOwner(request))) {
-        sendResponse(request, 409, "application/json; charset=utf-8",
-                     "{\"detail\":\"No active service session belongs to this device.\"}");
-        return;
-    }
-    if (!requestComesFromServiceOwner(request)) {
-        rejectForeignStation(request);
-        return;
-    }
-    serviceSessionActive = false;
-    serviceSessionPaused = false;
-    serviceSessionIsCharging = false;
-    serviceSessionRemainingMs = 0;
-    serviceSessionCredits = 0;
-    serviceSessionOwner = "";
-    serviceSessionPausedAtMs = 0;
-    setChargingRelay(false);
+    ServiceSlot* slot = requireOwnSlot(request);
+    if (!slot) return;
+    endServiceSlot(*slot, "ended by the customer");
     sendResponse(request, 200, "application/json; charset=utf-8",
                  "{\"ended\":true}");
 }
@@ -956,9 +1049,7 @@ err_t countingApInput(struct pbuf* p, struct netif* inp) {
             memcpy(&dstIp, frame + 30, 4);
             const bool toWalledGarden = walledGardenIp != 0 && dstIp == walledGardenIp &&
                                         isWalledGardenPort(frame, p->len);
-            const bool fromPaidClient = gateAllowedIp != 0 && srcIp == gateAllowedIp &&
-                                        gateAllowedMacKnown &&
-                                        memcmp(frame + 6, gateAllowedMac, 6) == 0;
+            const bool fromPaidClient = isPaidClient(srcIp, frame + 6);
             if (!broadcastOrMulticast && !toWalledGarden && !fromPaidClient) {
                 pbuf_free(p);
                 return ERR_OK;
@@ -1065,7 +1156,7 @@ struct BackendJob {
     String body;
 };
 
-constexpr size_t BACKEND_QUEUE_LENGTH = 8;
+constexpr size_t BACKEND_QUEUE_LENGTH = 16;
 constexpr size_t BACKEND_MAX_RESPONSE_BYTES = 8192;
 QueueHandle_t backendQueue = nullptr;
 
@@ -1073,11 +1164,22 @@ bool backendConfigured() {
     return strlen(SUNSYNC_BACKEND_URL) > 0 && strlen(SUNSYNC_DEVICE_API_KEY) > 0;
 }
 
-void queueForfeit(const String& owner, uint32_t credits) {
-    if (!backendConfigured() || !backendQueue || owner.length() > 100) return;
-    const String body = "{\"device_id\":\"" + owner + "\",\"credits\":" + String(credits) + "}";
-    BackendJob* job = new BackendJob{AsyncWebServerRequestPtr(), "POST", "/sessions/forfeit", body};
+void queueBackendJob(const char* method, const String& path, const String& body = String()) {
+    if (!backendConfigured() || !backendQueue) return;
+    BackendJob* job = new BackendJob{AsyncWebServerRequestPtr(), method, path, body};
     if (xQueueSend(backendQueue, &job, 0) != pdTRUE) delete job;
+}
+
+// If this is lost, the next telemetry report (which lists running sessions) confirms it.
+void queueSessionConfirm(int32_t backendId, const String& owner) {
+    if (backendId <= 0 || owner.length() == 0 || owner.length() > 100) return;
+    queueBackendJob("POST", "/sessions/" + String(backendId) + "/confirm?device_id=" + owner);
+}
+
+void queueForfeit(const String& owner, uint32_t credits) {
+    if (owner.length() > 100) return;
+    queueBackendJob("POST", "/sessions/forfeit",
+                    "{\"device_id\":\"" + owner + "\",\"credits\":" + String(credits) + "}");
 }
 
 bool isSafeIdentifier(const String& value, size_t maxLength) {
@@ -1090,17 +1192,20 @@ bool isSafeIdentifier(const String& value, size_t maxLength) {
 }
 
 // The telemetry reply lists every session the backend still considers active. If the admin
-// stopped ours from the cloud dashboard, the kiosk ends its local session as well.
+// stopped one from the cloud dashboard, the kiosk ends that local session as well.
 void endLocalSessionIfBackendClosed(const String& response) {
-    const int32_t id = serviceSessionBackendId;
-    if (!serviceSessionActive || id <= 0) return;
     static const char key[] = "\"active_session_ids\":[";
     const int listAt = response.indexOf(key);
     if (listAt < 0) return;
     const int listEnd = response.indexOf(']', listAt);
     if (listEnd < 0) return;
     const String list = "," + response.substring(listAt + strlen(key), listEnd) + ",";
-    if (list.indexOf("," + String(id) + ",") < 0) endLocalServiceSession();
+    for (ServiceSlot& slot : serviceSlots) {
+        if (!slot.active || slot.backendId <= 0) continue;
+        if (list.indexOf("," + String(slot.backendId) + ",") < 0) {
+            endServiceSlot(slot, "closed by the backend");
+        }
+    }
 }
 
 void applyRouterCommand(const String& response) {
@@ -1239,58 +1344,43 @@ void forwardToBackend(AsyncWebServerRequest* request, const char* method,
     }
 }
 
-// Reports the running Wi-Fi session's downloaded data to the backend every 30 s and once more
-// after it ends, so the dashboard can show usage per session.
-void reportSessionUsage() {
-    static uint8_t mac[6];
-    static bool macKnown = false;
-    static uint64_t baseline = 0, carry = 0;
-    static uint32_t lastReportMs = 0;
-    static String owner;
-
-    if (usageBaselinePending) {
-        usageBaselinePending = false;
-        carry = 0;
-        macKnown = false;
-        lastReportMs = millis();
-    }
-    const int32_t id = serviceSessionBackendId;
-    if (id <= 0) return;
-    const bool active = serviceSessionActive;
-    if (active && serviceSessionIsCharging) return;
-    if (!active && serviceSessionOwner.length() == 0 && owner.length() == 0) {
-        serviceSessionBackendId = 0;
-        return;
-    }
-    if (active) {
-        if (serviceSessionOwner.length() > 0) owner = serviceSessionOwner;
-        uint8_t current[6];
-        uint64_t down = 0, up = 0;
-        if (lookupStationMacByIp(serviceSessionClientIp, current) &&
-            (!macKnown || memcmp(current, mac, 6) != 0)) {
-            if (macKnown && getClientTraffic(mac, down, up) && down > baseline) {
-                carry += down - baseline;
-            }
-            memcpy(mac, current, 6);
-            baseline = getClientTraffic(mac, down, up) ? down : 0;
-            macKnown = true;
+// Tracks which MAC carries the slot's traffic; a phone that changes MAC keeps its earlier bytes.
+void trackSlotUsage(ServiceSlot& slot) {
+    uint8_t current[6];
+    uint64_t down = 0, up = 0;
+    if (lookupStationMacByIp(slot.clientIp, current) &&
+        (!slot.usageMacKnown || memcmp(current, slot.usageMac, 6) != 0)) {
+        if (slot.usageMacKnown && getClientTraffic(slot.usageMac, down, up) &&
+            down > slot.usageBaseline) {
+            slot.usageCarry += down - slot.usageBaseline;
         }
-        if (millis() - lastReportMs < 30000) return;
+        memcpy(slot.usageMac, current, 6);
+        slot.usageBaseline = getClientTraffic(slot.usageMac, down, up) ? down : 0;
+        slot.usageMacKnown = true;
     }
-    uint64_t total = carry, down = 0, up = 0;
-    if (macKnown && getClientTraffic(mac, down, up) && down > baseline) total += down - baseline;
-    const String path = "/sessions/" + String(id) + "/usage?device_id=" + owner +
-                        "&data_download_kb=" + String(static_cast<unsigned long>(total / 1024));
-    BackendJob* job = new BackendJob{AsyncWebServerRequestPtr(), "PATCH", path, String()};
-    if (xQueueSend(backendQueue, &job, 0) != pdTRUE) {
-        delete job;
-        return;
+}
+
+void reportSlotUsage(ServiceSlot& slot) {
+    if (slot.backendId <= 0 || slot.owner.length() == 0) return;
+    trackSlotUsage(slot);
+    uint64_t total = slot.usageCarry, down = 0, up = 0;
+    if (slot.usageMacKnown && getClientTraffic(slot.usageMac, down, up) &&
+        down > slot.usageBaseline) {
+        total += down - slot.usageBaseline;
     }
-    lastReportMs = millis();
-    if (!active) {
-        serviceSessionBackendId = 0;
-        owner = "";
-        macKnown = false;
+    queueBackendJob("PATCH", "/sessions/" + String(slot.backendId) + "/usage?device_id=" +
+                                 slot.owner + "&data_download_kb=" +
+                                 String(static_cast<unsigned long>(total / 1024)));
+    slot.lastUsageReportMs = millis();
+}
+
+// Reports each running Wi-Fi session's downloaded data to the backend every 30 s (and once more
+// when it ends, from endServiceSlot), so the dashboard can show usage per session.
+void reportSessionUsage() {
+    for (ServiceSlot& slot : serviceSlots) {
+        if (!slot.active || slot.isCharging || slot.backendId <= 0) continue;
+        trackSlotUsage(slot);
+        if (millis() - slot.lastUsageReportMs >= 30000) reportSlotUsage(slot);
     }
 }
 
@@ -1317,9 +1407,17 @@ void reportTelemetry() {
            "false" +
 #endif
            ",\"clients\":";
-     appendClientsJson(body);
-     body += ",\"local_session_id\":" +
-            String(serviceSessionActive ? static_cast<long>(serviceSessionBackendId) : 0L) + "}";
+    appendClientsJson(body);
+    // local_session_id is kept for older backends; local_session_ids lists every running session.
+    long firstId = 0;
+    String ids;
+    for (const ServiceSlot& slot : serviceSlots) {
+        if (!slot.active || slot.backendId <= 0) continue;
+        if (firstId == 0) firstId = slot.backendId;
+        if (ids.length()) ids += ",";
+        ids += String(static_cast<long>(slot.backendId));
+    }
+    body += ",\"local_session_id\":" + String(firstId) + ",\"local_session_ids\":[" + ids + "]}";
     BackendJob* job = new BackendJob{AsyncWebServerRequestPtr(), "POST", "/devices/telemetry", body};
     if (xQueueSend(backendQueue, &job, 0) != pdTRUE) delete job;
 }
@@ -1398,8 +1496,8 @@ void handleBackendSession(AsyncWebServerRequest* request) {
                      "{\"detail\":\"A numeric id and a valid action are required.\"}");
         return;
     }
-    if (serviceSessionActive && owner == serviceSessionOwner &&
-        !requestComesFromServiceOwner(request)) {
+    ServiceSlot* slot = findServiceSlot(owner);
+    if (slot && !requestComesFromSlotOwner(*slot, request)) {
         rejectForeignStation(request);
         return;
     }
@@ -1626,14 +1724,12 @@ void gateDnsTask(void*) {
         }
         clientSocket.read(query, length);
 
-        const uint32_t allowedIp = gateAllowedIp;
         const IPAddress upstreamDns = WiFi.dnsIP();
         size_t replySize = 0;
         uint8_t clientMac[6];
-        const bool clientIsPaidOwner = allowedIp != 0 &&
-            static_cast<uint32_t>(clientIp) == allowedIp && gateAllowedMacKnown &&
+        const bool clientIsPaidOwner =
             lookupStationMacByIp(static_cast<uint32_t>(clientIp), clientMac) &&
-            memcmp(clientMac, gateAllowedMac, 6) == 0;
+            isPaidClient(static_cast<uint32_t>(clientIp), clientMac);
         if (clientIsPaidOwner && upstreamDns != IPAddress(0, 0, 0, 0)) {
             upstreamSocket.beginPacket(upstreamDns, 53);
             upstreamSocket.write(query, length);
@@ -1818,7 +1914,7 @@ void startWatchdog() {
 
 void rebootIfUpstreamLostTooLong() {
     static uint32_t lostSinceMs = 0;
-    const bool idle = coinCredits == 0 && !coinPayWindowOpen && !serviceSessionActive;
+    const bool idle = coinCredits == 0 && !coinPayWindowOpen && !anyServiceActive();
     if (upstreamConnected || routerCutActive || !idle) {
         lostSinceMs = 0;
         return;
@@ -1840,14 +1936,7 @@ void loop() {
     updateRouterCut();
     reportSessionUsage();
     reportTelemetry();
-    gateAllowedIp = (serviceSessionActive && !serviceSessionPaused && !serviceSessionIsCharging)
-        ? serviceSessionClientIp : 0;
-    if (gateAllowedIp != 0 && serviceOwnerMacKnown) {
-        memcpy(gateAllowedMac, serviceOwnerMac, 6);
-        gateAllowedMacKnown = true;
-    } else {
-        gateAllowedMacKnown = false;
-    }
+    refreshGateEntries();
     updateLcd();
     serviceMqtt();
 
