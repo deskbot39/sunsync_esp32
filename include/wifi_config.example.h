@@ -25,7 +25,9 @@
 #define SUNSYNC_COIN_SIGNAL_PIN 5
 // 1 = pin idles LOW and pulses HIGH (needs a 3.3 V level shifter); 0 = idles HIGH and pulses LOW.
 #define SUNSYNC_COIN_SIGNAL_ACTIVE_HIGH 1
-#define SUNSYNC_COIN_PULSE_DEBOUNCE_US 30000
+#define SUNSYNC_COIN_PULSE_DEBOUNCE_US 40000
+// Pulses the acceptor emits per 1 peso (measured: 1). Credits are whole pesos.
+#define SUNSYNC_COIN_PULSES_PER_PESO 1
 
 #define SUNSYNC_MQTT_ENABLED 0
 #define SUNSYNC_MQTT_HOST ""
